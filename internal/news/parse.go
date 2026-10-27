@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/yoanbernabeu/stackalarm/internal/source"
 )
 
 // entry is what every parser returns, before the source fields are added.
@@ -21,6 +23,9 @@ type entry struct {
 	Published time.Time
 	Summary   string
 	Score     float64 // CVSS base score, when the source gives one
+	EPSS      float64
+	Affected  []Affected
+	Stage     source.Stage // when the entry says more than its source
 }
 
 type xmlLink struct {
@@ -149,20 +154,47 @@ func parseGitHubAdvisoryDatabase(data []byte) ([]entry, error) {
 	})
 }
 
+// parseGitHubMalware reads GET /advisories?type=malware: a package version
+// published with malicious code, an alert for a project that installs it.
+func parseGitHubMalware(data []byte) ([]entry, error) {
+	entries, err := parseGitHub(data, func(string) bool { return true })
+	for i := range entries {
+		entries[i].Title = "[malware] " + strings.TrimPrefix(strings.TrimPrefix(entries[i].Title, "[critical] "), "[unknown] ")
+		entries[i].Stage = source.StageAlert
+	}
+	return entries, err
+}
+
 // parseGitHubAdvisories reads GET /repos/{owner}/{repo}/security-advisories.
 func parseGitHubAdvisories(data []byte) ([]entry, error) {
 	return parseGitHub(data, func(string) bool { return true })
 }
 
 func parseGitHub(data []byte, keepSeverity func(string) bool) ([]entry, error) {
+	type score struct {
+		Score float64 `json:"score"`
+	}
 	var advisories []struct {
-		GHSA        string `json:"ghsa_id"`
-		CVE         string `json:"cve_id"`
-		URL         string `json:"html_url"`
-		Summary     string `json:"summary"`
-		Description string `json:"description"`
-		Severity    string `json:"severity"`
-		PublishedAt string `json:"published_at"`
+		GHSA           string           `json:"ghsa_id"`
+		CVE            string           `json:"cve_id"`
+		URL            string           `json:"html_url"`
+		Summary        string           `json:"summary"`
+		Description    string           `json:"description"`
+		Severity       string           `json:"severity"`
+		PublishedAt    string           `json:"published_at"`
+		CVSS           score            `json:"cvss"`
+		CVSSSeverities map[string]score `json:"cvss_severities"`
+		EPSS           struct {
+			Percentage float64 `json:"percentage"`
+		} `json:"epss"`
+		Vulnerabilities []struct {
+			Package struct {
+				Name string `json:"name"`
+			} `json:"package"`
+			Range        string `json:"vulnerable_version_range"`
+			FirstPatched string `json:"first_patched_version"` // GitHub Advisory Database
+			Patched      string `json:"patched_versions"`      // repository advisories
+		} `json:"vulnerabilities"`
 	}
 	if err := json.Unmarshal(data, &advisories); err != nil {
 		return nil, fmt.Errorf("unexpected GitHub response: %w", err)
@@ -179,7 +211,15 @@ func parseGitHub(data []byte, keepSeverity func(string) bool) ([]entry, error) {
 		if id := firstNonEmpty(a.CVE, a.GHSA); id != "" {
 			title += " (" + id + ")"
 		}
-		e := entry{Title: clean(title), URL: a.URL, Summary: clean(a.Description)}
+		e := entry{Title: clean(title), URL: a.URL, Summary: clean(a.Description), Score: a.CVSS.Score, EPSS: a.EPSS.Percentage}
+		for _, s := range a.CVSSSeverities {
+			e.Score = max(e.Score, s.Score)
+		}
+		for _, v := range a.Vulnerabilities {
+			if v.Package.Name != "" {
+				e.Affected = append(e.Affected, Affected{Package: v.Package.Name, Versions: v.Range, Fixed: cmp.Or(v.FirstPatched, v.Patched)})
+			}
+		}
 		e.Published, _ = parseDate(a.PublishedAt)
 		out = append(out, e)
 	}
@@ -253,6 +293,7 @@ const minScore = 7.0
 // parseNVD reads a response of the NVD CVE API 2.0.
 func parseNVD(data []byte) ([]entry, error) {
 	var r struct {
+		TotalResults    int `json:"totalResults"`
 		Vulnerabilities []struct {
 			CVE struct {
 				ID           string `json:"id"`
@@ -294,7 +335,19 @@ func parseNVD(data []byte) ([]entry, error) {
 		e.Published, _ = parseDate(v.CVE.Published)
 		out = append(out, e)
 	}
+	if r.TotalResults > len(r.Vulnerabilities) { // one page holds 2,000 records
+		return out, fmt.Errorf("partial: %d records, only %d read (use more precise keywords or a shorter --since)", r.TotalResults, len(r.Vulnerabilities))
+	}
 	return out, nil
+}
+
+// euvdTotal reads the number of records an EUVD search matched, over all pages.
+func euvdTotal(data []byte) int {
+	var r struct {
+		Total int `json:"total"`
+	}
+	_ = json.Unmarshal(data, &r) // a list endpoint has no total: one page
+	return r.Total
 }
 
 // parseEUVD reads a list or a search result of the ENISA EUVD API.

@@ -17,8 +17,8 @@ var markdownSections = []struct {
 	noun   string
 	folded bool
 }{
-	{source.StageHeadsUp, "Heads-up: security releases announced", "heads-up", false},
-	{source.StageAlert, "Alerts: CERT alerts, public exploits, exploitation in the wild", "alert", false},
+	{source.StageHeadsUp, "Heads-up: security releases and ends of support announced", "heads-up", false},
+	{source.StageAlert, "Alerts: CERT alerts, public exploits, exploitation in the wild, ends of support", "alert", false},
 	{source.StageRelease, "Releases with security fixes", "release", false},
 	{source.StageAdvisory, "Advisories", "advisory", true},
 	{source.StageNews, "Press and research", "news item", true},
@@ -86,6 +86,15 @@ func (a *App) printMarkdown(r newsReport) {
 			}
 			if len(it.AlsoIn) > 0 {
 				line += ", also in " + strings.Join(it.AlsoIn, ", ")
+			}
+			if it.EPSS > 0 {
+				line += ", EPSS " + epss(it.EPSS)
+			}
+			if len(it.ExploitedIn) > 0 {
+				line += ", **exploited in the wild** (" + strings.Join(it.ExploitedIn, ", ") + ")"
+			}
+			if aff := affected(it); aff != "" {
+				line += "\n  Affects " + mdText(aff)
 			}
 			if link := mdLink(it.URL); link != "" {
 				line += "\n  " + link

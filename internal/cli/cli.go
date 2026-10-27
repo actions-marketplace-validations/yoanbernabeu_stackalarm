@@ -54,6 +54,9 @@ func Default(version string) (*App, error) {
 			UserAgent: "stackalarm/" + version + " (+https://github.com/yoanbernabeu/stackalarm)",
 			CacheTTL:  time.Hour,
 			NVDDelay:  6 * time.Second, // 5 requests per 30 s without a key
+			EUVDDelay: time.Second,
+			EPSSAPI:   "https://api.first.org/data/v1/epss",
+			EOLAPI:    "https://endoflife.date/api/v1",
 			Search:    search,
 		},
 	}, nil
@@ -71,7 +74,7 @@ func (a *App) Execute(ctx context.Context) int {
 	}
 	root.SetOut(a.Out)
 	root.SetErr(a.Err)
-	root.AddCommand(a.newsCommand(), a.sourcesCommand())
+	root.AddCommand(a.newsCommand(), a.sourcesCommand(), a.eolCommand())
 	if a.Args != nil {
 		root.SetArgs(a.Args)
 	}
@@ -98,6 +101,7 @@ type newsReport struct {
 	Items       []news.Item       `json:"items"`
 	Failures    []news.Failure    `json:"failures"`
 	Truncated   []news.Truncation `json:"truncated"`
+	Short       []news.Coverage   `json:"short"` // feeds that do not reach back to Since
 	Warnings    []string          `json:"warnings"`
 	// AlreadyReported counts the items left out because the state file says
 	// an earlier run reported them.
@@ -130,7 +134,7 @@ For a scheduled watch, --profile reads the tags, keywords and packages from a
 file the agent wrote, --state shows only the items no earlier run reported, and
 --fail-on exits with code 2 when a new item has one of the given stages.`,
 		Example: "  stackalarm news --tag php --tag symfony --since 7d\n" +
-			"  stackalarm news --tag node --tag npm --package express,dompurify --format json\n" +
+			"  stackalarm news --tag node --tag npm --package express@4.21.2,dompurify@3.2.3 --format json\n" +
 			"  stackalarm news --profile .stackalarm.yaml --state .stackalarm-state --fail-on heads-up,alert,release --since 48h --format markdown",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -185,14 +189,30 @@ file the agent wrote, --state shows only the items no earlier run reported, and
 				}
 			}
 			now := a.Now().UTC()
+			// A profile tells the versions in use: a scheduled watch also learns
+			// when their security fixes stop, which no advisory announces.
+			var (
+				eol     []news.Item
+				eolErr  error
+				eolDone = make(chan struct{})
+			)
+			go func() {
+				defer close(eolDone)
+				eol, eolErr = f.SupportItems(cmd.Context(), stack)
+			}()
 			res := f.Fetch(cmd.Context(), a.Sources, news.Query{Tags: tags, Keywords: keywords, Since: now.Add(-window), Packages: packages})
+			<-eolDone
+			if eolErr != nil {
+				res.Failures = append(res.Failures, news.Failure{Source: news.SupportSource, Error: eolErr.Error()})
+			}
+			res.Items = append(eol, res.Items...)
 			if len(res.NotSearched) > 0 {
 				warnings = append(warnings, fmt.Sprintf("the CVE databases are searched for %d words at most, in the order given: %s not searched (their tagged sources were still read); put the most important tags and keywords first, or run again for these",
 					news.MaxTerms, strings.Join(res.NotSearched, ", ")))
 			}
 			report := newsReport{
 				GeneratedAt: now, Since: now.Add(-window), Tags: nonNil(tags), Keywords: nonNil(keywords), Packages: packages, Stack: stack,
-				Items: res.Items, Failures: res.Failures, Truncated: res.Truncated, Warnings: nonNil(warnings),
+				Items: res.Items, Failures: res.Failures, Truncated: res.Truncated, Short: res.Short, Warnings: nonNil(warnings),
 			}
 			if statePath != "" {
 				report.Items = slices.DeleteFunc(report.Items, func(it news.Item) bool {
@@ -237,7 +257,7 @@ file the agent wrote, --state shows only the items no earlier run reported, and
 	}
 	cmd.Flags().StringSliceVarP(&tags, "tag", "t", nil, "technology to watch, repeatable (php, node, gitlab…)")
 	cmd.Flags().StringSliceVarP(&keywords, "keyword", "k", nil, "extra word to look for in general sources, repeatable (frankenphp, express…)")
-	cmd.Flags().StringSliceVarP(&packages, "package", "p", nil, "package names from the lockfile, repeatable: GitHub Advisory Database sources then return only their advisories")
+	cmd.Flags().StringSliceVarP(&packages, "package", "p", nil, "packages from the lockfile, repeatable, with their version or not (next@15.1.0, dompurify): GitHub Advisory Database sources then return only their advisories, for that version")
 	cmd.Flags().StringVar(&since, "since", "7d", "how far back to look: 24h, 7d, 2w…")
 	cmd.Flags().StringVar(&format, "format", "text", "output format: text, summary (one line per item, for agents), json or markdown (an issue body)")
 	cmd.Flags().BoolVar(&noCache, "no-cache", false, "always fetch the sources (responses are otherwise reused for an hour)")
@@ -264,6 +284,9 @@ func (a *App) printNews(r newsReport) {
 	}
 	for _, it := range r.Items {
 		fmt.Fprintf(a.Out, "%s  %-9s %-24s %s\n", it.Published.Format("2006-01-02"), it.Stage, it.Source, it.Title)
+		if aff := affected(it); aff != "" {
+			fmt.Fprintf(a.Out, "%38saffects %s\n", "", aff)
+		}
 		if it.URL != "" {
 			fmt.Fprintf(a.Out, "%38s%s\n", "", it.URL)
 		}
@@ -272,6 +295,12 @@ func (a *App) printNews(r newsReport) {
 		fmt.Fprintf(a.Out, "\nOnly the %d most recent entries are shown for:\n", news.MaxPerSource)
 		for _, t := range r.Truncated {
 			fmt.Fprintf(a.Out, "  %s: %d older entries left out (narrow with --since or more precise keywords)\n", t.Source, t.Dropped)
+		}
+	}
+	if len(r.Short) > 0 {
+		fmt.Fprintln(a.Out, "\nFeeds that do not go back to the start of the period (older news may be missing):")
+		for _, c := range r.Short {
+			fmt.Fprintf(a.Out, "  %s: since %s\n", c.Source, c.Since.Format("2006-01-02 15:04"))
 		}
 	}
 	if len(r.Failures) > 0 {
@@ -294,6 +323,15 @@ func (a *App) printSummary(r newsReport) {
 		if len(it.AlsoIn) > 0 {
 			line += " | also in " + strings.Join(it.AlsoIn, ",")
 		}
+		if len(it.ExploitedIn) > 0 {
+			line += " | EXPLOITED in the wild (" + strings.Join(it.ExploitedIn, ",") + ")"
+		}
+		if aff := affected(it); aff != "" {
+			line += " | affects " + aff
+		}
+		if it.EPSS > 0 {
+			line += " | EPSS " + epss(it.EPSS)
+		}
 		fmt.Fprintln(a.Out, line)
 	}
 	for _, f := range r.Failures {
@@ -302,12 +340,76 @@ func (a *App) printSummary(r newsReport) {
 	for _, t := range r.Truncated {
 		fmt.Fprintf(a.Out, "TRUNCATED | %s | %d older entries left out\n", t.Source, t.Dropped)
 	}
+	for _, c := range r.Short {
+		fmt.Fprintf(a.Out, "SHORT | %s | its feed only goes back to %s\n", c.Source, c.Since.Format("2006-01-02 15:04"))
+	}
 	for _, w := range r.Warnings {
 		fmt.Fprintf(a.Out, "WARNING | %s\n", w)
 	}
 	if r.AlreadyReported > 0 {
 		fmt.Fprintf(a.Out, "ALREADY REPORTED | %d items left out\n", r.AlreadyReported)
 	}
+}
+
+func (a *App) eolCommand() *cobra.Command {
+	var format, profilePath string
+	cmd := &cobra.Command{
+		Use:   "eol [name@version...]",
+		Short: "Tell whether the runtimes and frameworks in use still get security fixes",
+		Long: `Look up the support status of each component on endoflife.date: the cycle
+its version belongs to, when its security fixes stop, and whether a newer
+release of the same cycle is out.
+
+Statuses, from the most urgent: eol (no more security fixes), ending (they
+stop within 180 days), behind (a newer patch release is out), supported, and
+unknown (not on endoflife.date, or a version too vague to find its cycle).
+With --profile, the components are read from the stack of the profile.`,
+		Example: "  stackalarm eol php@8.3.35 node@22 gitlab@17.5\n" +
+			"  stackalarm eol --profile .stackalarm.yaml --format json",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !slices.Contains([]string{"text", "json"}, format) {
+				return fmt.Errorf("--format %q: use text or json", format)
+			}
+			if profilePath != "" {
+				p, err := watch.LoadProfile(profilePath)
+				if err != nil {
+					return fmt.Errorf("--profile: %w", err)
+				}
+				for _, c := range p.Stack {
+					if c.Version == "unknown" {
+						c.Version = ""
+					}
+					args = append(args, strings.TrimSuffix(c.Name+"@"+c.Version, "@"))
+				}
+			}
+			if len(args) == 0 {
+				return errors.New("name the components (php@8.3.35 node@22) or give --profile")
+			}
+			f := *a.Fetcher
+			f.Now = a.Now
+			if dir, err := a.CacheRoot(); err == nil {
+				f.CacheDir = filepath.Join(dir, "stackalarm")
+			}
+			support, err := f.Support(cmd.Context(), args)
+			if err != nil {
+				return err
+			}
+			if format == "json" {
+				enc := json.NewEncoder(a.Out)
+				enc.SetIndent("", "  ")
+				return enc.Encode(map[string]any{"generated_at": a.Now().UTC(), "components": support})
+			}
+			w := tabwriter.NewWriter(a.Out, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "COMPONENT\tCYCLE\tSTATUS\tNOTE")
+			for _, s := range support {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", strings.TrimSuffix(s.Name+" "+s.Version, " "), cmp.Or(s.Cycle, "-"), s.Status, s.Note)
+			}
+			return w.Flush()
+		},
+	}
+	cmd.Flags().StringVar(&format, "format", "text", "output format: text or json")
+	cmd.Flags().StringVar(&profilePath, "profile", "", "project profile written by the agent (.stackalarm.yaml): its stack is looked up")
+	return cmd
 }
 
 func (a *App) sourcesCommand() *cobra.Command {
@@ -337,6 +439,36 @@ func (a *App) sourcesCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&format, "format", "text", "output format: text or json")
 	return cmd
+}
+
+// maxAffected keeps a line short: some advisories name dozens of packages.
+const maxAffected = 3
+
+// affected describes the packages of an advisory: "vite 6.4.4 (fixed in 6.4.5)".
+func affected(it news.Item) string {
+	var parts []string
+	for i, af := range it.Affected {
+		if i == maxAffected {
+			parts = append(parts, fmt.Sprintf("and %d more", len(it.Affected)-maxAffected))
+			break
+		}
+		part := af.Package + " " + cmp.Or(af.Versions, "all versions")
+		if af.Fixed != "" {
+			part += " (fixed in " + af.Fixed + ")"
+		} else {
+			part += " (no fix yet)"
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// epss writes a probability as a percentage: "0.4%", "37%".
+func epss(p float64) string {
+	if p < 0.1 {
+		return fmt.Sprintf("%.1f%%", p*100)
+	}
+	return fmt.Sprintf("%.0f%%", p*100)
 }
 
 func lower(s []string) []string {

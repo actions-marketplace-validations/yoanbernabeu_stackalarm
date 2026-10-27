@@ -6,6 +6,7 @@ import { stages } from "../../lib/sources";
 
 const newsHelp = cliHelp("news");
 const sourcesHelp = cliHelp("sources");
+const eolHelp = cliHelp("eol");
 const stageText: Record<string, string> = {
   "heads-up": "A security release is announced ahead. When the same feed announces the release itself, the item becomes a release.",
   release: "The fix is out.",
@@ -14,7 +15,7 @@ const stageText: Record<string, string> = {
   news: "Security press and research: context, never enough on its own to call a project affected.",
 };
 ---
-<Docs title="The CLI" description="stackalarm news and stackalarm sources: options, output formats, stages, limits, cache and exit codes.">
+<Docs title="The CLI" description="stackalarm news, eol and sources: options, output formats, stages, limits, cache and exit codes.">
   <p class="lead-in">
     The CLI gathers the news; it does no project analysis. The skill runs it for you, but it works on its own too. The help below is printed by
     the CLI itself when this page is built.
@@ -30,6 +31,25 @@ const stageText: Record<string, string> = {
     An unknown tag is searched as a keyword, with a warning that lists the known tags. Each tag and keyword costs one search per CVE database.
   </p>
 
+  <h3 id="packages">Packages and versions</h3>
+  <p>
+    With an ecosystem tag (<code>npm</code>, <code>composer</code>, <code>pip</code>…), <code>--package</code> narrows the GitHub Advisory
+    Database to the packages of the project. Give the locked version (<code>next@15.1.0</code>) and only the advisories that hit that version
+    are returned; on a typical Next.js project, that leaves out two advisories in three. Each advisory shows the affected packages, the
+    vulnerable range and the first fixed version, the range holding your version first.
+  </p>
+  <p>
+    With <code>--package</code>, the GitHub malware advisories of those packages are read too, as alerts: a version published with malicious
+    code, the mark of a compromised maintainer account. They are not read without packages: npm alone gets about a thousand a month.
+  </p>
+
+  <h3 id="exploitation">Exploitation and EPSS</h3>
+  <p>
+    A CVE listed in the CISA KEV catalog or the EUVD list of exploited flaws is marked exploited wherever it appears, whatever the date it
+    was added: an old flaw can be exploited today. Exploited CVEs are kept first under the cap. Each CVE also gets its EPSS, the probability
+    of exploitation in the next 30 days computed by FIRST, from GitHub or from the FIRST API.
+  </p>
+
   <h3 id="stages">Stages</h3>
   <table>
     <thead><tr><th scope="col">Stage</th><th scope="col">Meaning</th></tr></thead>
@@ -43,16 +63,18 @@ const stageText: Record<string, string> = {
     <thead><tr><th scope="col">Format</th><th scope="col">For</th></tr></thead>
     <tbody>
       <tr><td><code>text</code></td><td>Reading in a terminal. The default.</td></tr>
-      <tr><td><code>summary</code></td><td>Agents: one line per item (date, stage, source, score, title, link, other databases listing the same CVE), then the failed and truncated sources.</td></tr>
-      <tr><td><code>json</code></td><td>Scripts: the items with their summaries, plus <code>failures</code>, <code>truncated</code> and <code>warnings</code>.</td></tr>
+      <tr><td><code>summary</code></td><td>Agents: one line per item (date, stage, source, score, title, link, other databases listing the same CVE, affected packages with the first fixed version, EPSS, the sources reporting it exploited), then the failed and truncated sources.</td></tr>
+      <tr><td><code>json</code></td><td>Scripts: the items with their summaries, plus <code>failures</code>, <code>truncated</code>, <code>short</code> and <code>warnings</code>.</td></tr>
       <tr><td><code>markdown</code></td><td>An issue body, used by the scheduled watch.</td></tr>
     </tbody>
   </table>
 
   <h3 id="limits">Limits, failures and cache</h3>
   <ul>
-    <li>Each source shows at most 30 entries. For the CVE databases, the most severe come first, so the cap drops the minor ones. The output lists the sources that had more.</li>
+    <li>Each source shows at most 30 entries. For the CVE databases, the most severe come first, so the cap drops the minor ones. A CVE found in several databases is shown once and takes one place. The output lists the sources that had more.</li>
+    <li>Paginated APIs (GitHub, EUVD) are read page by page, up to 10 pages per query. A query that matches more is reported as a <code>partial</code> failure, with what was read.</li>
     <li>A source that cannot be read is always listed: a silent watch tool is worse than a noisy one.</li>
+    <li>A feed keeps only its latest entries: when its oldest one is newer than the start of the period, it is listed as <code>short</code>, since older news may be missing. A scheduled watch that runs every few hours is not affected.</li>
     <li>Responses are reused for an hour, from <code>stackalarm</code> in your user cache folder. <code>--no-cache</code> fetches everything again.</li>
     <li>Without <code>NVD_API_KEY</code>, the NVD allows one request every 6 seconds; with it, about one every 0.7 seconds.</li>
   </ul>
@@ -74,6 +96,14 @@ const stageText: Record<string, string> = {
     keeps the previous state. <code>--fail-on</code> turns new items into exit code 2. See <a href="/docs/watch/">Scheduled watch</a>.
   </p>
   <Code code="stackalarm news --profile .stackalarm.yaml --state .stackalarm-state --fail-on heads-up,alert,release --since 48h --format markdown" copy={false} />
+
+  <h2 id="eol"><code>stackalarm eol</code></h2>
+  <Code label="stackalarm eol --help" code={eolHelp} copy={false} />
+  <p>
+    A runtime past its end of life gets no fix for the next flaw, and no advisory will say so: the news only covers what is still
+    maintained. <code>eol</code> reads <a href="https://endoflife.date">endoflife.date</a> for each component and gives its cycle, the date
+    its security fixes stop, and the latest release of the cycle. Only names and versions are sent, never the project.
+  </p>
 
   <h2 id="sources"><code>stackalarm sources</code></h2>
   <Code label="stackalarm sources --help" code={sourcesHelp} copy={false} />
