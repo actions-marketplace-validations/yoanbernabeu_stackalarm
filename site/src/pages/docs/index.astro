@@ -58,6 +58,15 @@ const githubSources = loadSources().filter((s) => s.type.startsWith("github-")).
     to api.github.com.
   </p>
 
+  <h2 id="update">Update</h2>
+  <p>
+    The skill and the CLI go together. A new CLI with an old skill still answers, but the agent does not know the newer commands, and nothing
+    says so. Update both: the skill with the install command again, the CLI with the tool that installed it.
+  </p>
+  <Code label="The skill" code="npx skills add yoanbernabeu/stackalarm" />
+  <Code label="The CLI, with Homebrew" code="brew upgrade stackalarm" />
+  <Code label="The CLI, with the install script" code={`curl -sSL ${raw}/install.sh | sh`} />
+
   <h2 id="run">Run a check</h2>
   <p>Open a project in your agent and call the skill by name. Anything you add after it becomes the focus of the check:</p>
   <Code code={`/stackalarm\n/stackalarm before the Friday deploy\n/stackalarm are we affected by PHP2Shell?`} copy={false} />
