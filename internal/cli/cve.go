@@ -68,6 +68,11 @@ read is reported, and the others still answer.`,
 	return cmd
 }
 
+// maxCVEAffected keeps the record readable: the NVD can list dozens of
+// products a flaw reaches through a bundled copy. The ranges of the versions
+// given come first, so they are never the ones cut.
+const maxCVEAffected = 12
+
 func (a *App) printCVE(r news.CVERecord) {
 	w := a.Out
 	if len(r.FoundIn) == 0 {
@@ -121,9 +126,16 @@ func (a *App) printCVE(r news.CVERecord) {
 		}
 		if len(r.Affected) > 0 {
 			fmt.Fprintln(w, "\nAffected:")
-			for _, af := range r.Affected {
+			for i, af := range r.Affected {
+				if i == maxCVEAffected {
+					fmt.Fprintf(w, "  and %d more ranges, of other products or versions (--format json lists them all)\n", len(r.Affected)-maxCVEAffected)
+					break
+				}
 				fmt.Fprintf(w, "  %s\n", affected(news.Item{Affected: []news.Affected{af}}))
 			}
+		}
+		if len(r.NotNamed) > 0 {
+			fmt.Fprintf(w, "\nNamed in no range: %s. No sign of safety: the record may name the product otherwise, or the product may bundle another's code (Next.js bundles React's); read the product's own advisory.\n", strings.Join(r.NotNamed, ", "))
 		}
 		if len(r.Advisories) > 0 {
 			fmt.Fprintln(w, "\nAdvisories:")

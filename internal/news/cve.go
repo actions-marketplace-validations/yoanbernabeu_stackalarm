@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/yoanbernabeu/stackalarm/internal/source"
 )
@@ -33,9 +34,12 @@ type CVERecord struct {
 	PublicExploitIn []string   `json:"public_exploit_in,omitempty"`
 	Affected        []Affected `json:"affected,omitempty"`
 	Advisories      []string   `json:"advisories,omitempty"` // GitHub advisories
-	References      []string   `json:"references,omitempty"`
-	FoundIn         []string   `json:"found_in"` // the databases that know the CVE
-	Failures        []Failure  `json:"failures"`
+	// NotNamed lists the packages given with a version that no range names: a
+	// product bundling another's code (Next.js and React) may still be hit.
+	NotNamed   []string  `json:"not_named,omitempty"`
+	References []string  `json:"references,omitempty"`
+	FoundIn    []string  `json:"found_in"` // the databases that know the CVE
+	Failures   []Failure `json:"failures"`
 }
 
 // maxReferences keeps a record readable: some CVEs carry dozens of links.
@@ -53,6 +57,9 @@ func ValidCVE(id string) bool { return cvePattern.MatchString(id) }
 // is reported in Failures, and the others still answer.
 func (f *Fetcher) CVE(ctx context.Context, id string, sources []source.Source, inUse []string) CVERecord {
 	rec := CVERecord{ID: id, FoundIn: []string{}, Failures: []Failure{}}
+	if f.nvdRejected == nil {
+		f.nvdRejected = new(atomic.Bool)
+	}
 	var (
 		mu sync.Mutex
 		wg sync.WaitGroup
@@ -118,8 +125,32 @@ func (f *Fetcher) CVE(ctx context.Context, id string, sources []source.Source, i
 		}
 		return err
 	})
+	var composer []string // the Composer packages given: Packagist knows their ranges under their own name
+	for _, p := range inUse {
+		if name := packageName(p); strings.Count(name, "/") == 1 && !strings.HasPrefix(name, "@") {
+			composer = append(composer, name)
+		}
+	}
+	var packagist []Affected
 	for _, s := range sources {
 		switch {
+		case s.Type == source.TypePackagist && len(composer) > 0:
+			run(s.ID, func() error {
+				q := neturl.Values{}
+				for _, n := range composer {
+					q.Add("packages[]", n)
+				}
+				entries, err := f.packagistAdvisories(ctx, s.URL+"?"+q.Encode(), nil, nil)
+				mu.Lock()
+				defer mu.Unlock()
+				for _, e := range entries {
+					if cveID.FindString(e.Title) == id {
+						found(s.ID)
+						packagist = append(packagist, e.Affected...)
+					}
+				}
+				return err
+			})
 		case s.Type == source.TypeNVD:
 			run(s.ID, func() error {
 				data, _, err := f.get(ctx, s.URL+"?cveId="+id, "nvd")
@@ -161,6 +192,9 @@ func (f *Fetcher) CVE(ctx context.Context, id string, sources []source.Source, i
 		}
 	}
 	wg.Wait()
+	if f.nvdKeyRejected() {
+		rec.Failures = append(rec.Failures, Failure{Source: "nvd-api-key", Error: NVDKeyRejected})
+	}
 
 	if rec.EPSS == 0 && f.EPSSAPI != "" {
 		items := []Item{{cve: id}}
@@ -173,20 +207,65 @@ func (f *Fetcher) CVE(ctx context.Context, id string, sources []source.Source, i
 	// Package ranges first (they name what a lockfile holds), then the vendor's
 	// own, then the NVD products. The databases repeat each other under other
 	// names (next, next.js): a range already listed is not listed again.
-	for _, a := range slices.Concat(github, program, nvd) {
+	for _, a := range slices.Concat(github, packagist, program, nvd) {
 		if !slices.ContainsFunc(rec.Affected, func(b Affected) bool {
-			return a == b || a.Versions != "" && a.Versions == b.Versions
+			return a == b || a.Versions != "" && a.Versions == b.Versions && sameProduct(a.Package, b.Package)
 		}) {
 			rec.Affected = append(rec.Affected, a)
 		}
 	}
-	q := Query{Packages: inUse, Versions: map[string]string{}}
+	// The products the description names first: CVE-2023-4863 is a libwebp
+	// flaw, and the NVD lists dozens of products that bundle it before it.
+	text := normalName(rec.Title + " " + rec.Description)
+	slices.SortStableFunc(rec.Affected, func(a, b Affected) int {
+		named := func(x Affected) int {
+			if n := normalName(x.Package); len(n) > 2 && strings.Contains(text, n) {
+				return 0
+			}
+			return 1
+		}
+		return cmp.Compare(named(a), named(b))
+	})
+	// Each version given is compared, two of one product too (postgresql@16.16
+	// and postgresql@16.15, two servers): the first one marks the ranges, each
+	// other one a copy of the ranges of its product.
+	var rounds [][]string
+	seen := map[string]int{}
 	for _, p := range inUse {
-		if name := packageName(p); name != p {
-			q.Versions[strings.ToLower(name)] = strings.TrimPrefix(p, name+"@")
+		name := strings.ToLower(packageName(p))
+		k := seen[name]
+		seen[name]++
+		if k == len(rounds) {
+			rounds = append(rounds, nil)
+		}
+		rounds[k] = append(rounds[k], p)
+	}
+	base := slices.Clone(rec.Affected)
+	for k, round := range rounds {
+		q := Query{Packages: round, Versions: map[string]string{}}
+		for _, p := range round {
+			if name := packageName(p); name != p {
+				q.Versions[strings.ToLower(name)] = strings.TrimPrefix(p, name+"@")
+			}
+		}
+		if k == 0 {
+			rec.Affected = annotate(rec.Affected, q, false)
+			continue
+		}
+		var more []Affected
+		for _, a := range base {
+			if slices.ContainsFunc(round, func(p string) bool { n := packageName(p); return a.Package == n || strings.EqualFold(a.Package, n) }) {
+				more = append(more, a)
+			}
+		}
+		rec.Affected = append(rec.Affected, annotate(more, q, false)...)
+	}
+	for _, p := range inUse {
+		name := packageName(p)
+		if name != p && len(rec.Affected) > 0 && !slices.ContainsFunc(rec.Affected, func(a Affected) bool { return sameProduct(a.Package, name) }) {
+			rec.NotNamed = append(rec.NotNamed, name)
 		}
 	}
-	rec.Affected = annotate(rec.Affected, q)
 	slices.Sort(rec.FoundIn)
 	slices.Sort(rec.ExploitedIn)
 	slices.Sort(rec.PublicExploitIn)
@@ -194,6 +273,14 @@ func (f *Fetcher) CVE(ctx context.Context, id string, sources []source.Source, i
 	rec.Advisories = slices.Compact(rec.Advisories)
 	slices.SortFunc(rec.Failures, func(a, b Failure) int { return cmp.Compare(a.Source, b.Source) })
 	return rec
+}
+
+// sameProduct tells whether two databases name one product: "next" and
+// "next.js", "PHP" and "php". react-server-dom-webpack and
+// react-server-dom-parcel are two packages, even with the same ranges.
+func sameProduct(a, b string) bool {
+	x, y := normalName(a), normalName(b)
+	return x == y || x+"js" == y || y+"js" == x
 }
 
 type cveProgram struct {
@@ -289,9 +376,15 @@ func parseCVEProgram(data []byte) (cveProgram, error) {
 		}
 	}
 	for _, a := range cna.Affected {
+		if na(a.Product) {
+			continue // "n/a": the record names no product
+		}
 		for _, v := range a.Versions {
-			if v.Status != "affected" || len(p.Affected) == maxNVDAffected {
+			if v.Status != "affected" || len(p.Affected) == maxNVDAffected || na(v.Version) && v.LessThan == "" && v.LessThanOrEqual == "" {
 				continue
+			}
+			if na(v.Version) {
+				v.Version = ""
 			}
 			af := Affected{Package: a.Product, Versions: v.Version}
 			from := v.Version
@@ -302,9 +395,15 @@ func parseCVEProgram(data []byte) (cveProgram, error) {
 			case v.LessThan != "" && v.LessThan != "*":
 				af.Versions, af.Fixed = osvRange(from, "< "+v.LessThan), v.LessThan
 			case v.LessThanOrEqual != "" && v.LessThanOrEqual != "*":
-				af.Versions = osvRange(from, "<= "+v.LessThanOrEqual)
+				af.Versions, af.FixUnknown = osvRange(from, "<= "+v.LessThanOrEqual), true
 			case v.LessThan == "*" || v.LessThanOrEqual == "*":
 				af.Versions = osvRange(from, "")
+			case strings.ContainsAny(v.Version, "<>"): // the range written as text: ">= 15.0.0, < 15.2.3"
+				af.Versions = tidyRange(v.Version)
+				af.Fixed = fixedIn(af.Versions)
+				af.FixUnknown = af.Fixed == ""
+			default: // one release
+				af.FixUnknown = true
 			}
 			if !slices.Contains(p.Affected, af) {
 				p.Affected = append(p.Affected, af)
@@ -312,6 +411,12 @@ func parseCVEProgram(data []byte) (cveProgram, error) {
 		}
 	}
 	return p, nil
+}
+
+// na tells the placeholders a record writes for "not given".
+func na(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return s == "n/a" || s == "na" || s == "unknown"
 }
 
 // CVEURL is the page of a CVE on cve.org.

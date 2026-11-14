@@ -30,6 +30,10 @@ type entry struct {
 	Exact     bool         // found by product in a search source: kept whatever its wording
 	Current   bool         // hits a version in use now: kept whatever its date
 	Exploit   bool         // an entry of a catalog of public exploits: it marks its CVE
+	Product   string       // "vendor|product" of a KEV entry, matched against the tags with a version
+	Alone     bool         // never merged with another item of its CVE (a package of one image among several)
+	Scope     string       // with Alone, the SBOM of the package: merged with the items of that SBOM only
+	Related   []string     // upstream CVEs an advisory is about besides its own id: they carry the marks of exploitation
 	// Rank orders the entry among those of its source in place of Score, when a
 	// distribution rates the flaw itself (Ubuntu's priority, Debian's "unimportant").
 	Rank float64
@@ -173,11 +177,18 @@ func parseGitHubMalware(data []byte) ([]entry, error) {
 }
 
 // parseGitHubAdvisories reads GET /repos/{owner}/{repo}/security-advisories.
+// parseGitHubAdvisories reads the advisories of a repository. One with a CVE
+// updated well after its publication is dated by the update: React's RSC flaw
+// was published on October 14 and got its CVE, and its audience, on November 10.
 func parseGitHubAdvisories(data []byte) ([]entry, error) {
-	return parseGitHub(data, func(string) bool { return true })
+	return parseGitHubDated(data, func(string) bool { return true }, true)
 }
 
 func parseGitHub(data []byte, keepSeverity func(string) bool) ([]entry, error) {
+	return parseGitHubDated(data, keepSeverity, false)
+}
+
+func parseGitHubDated(data []byte, keepSeverity func(string) bool, cveDate bool) ([]entry, error) {
 	type score struct {
 		Score float64 `json:"score"`
 	}
@@ -189,6 +200,9 @@ func parseGitHub(data []byte, keepSeverity func(string) bool) ([]entry, error) {
 		Description    string           `json:"description"`
 		Severity       string           `json:"severity"`
 		PublishedAt    string           `json:"published_at"`
+		UpdatedAt      string           `json:"updated_at"`
+		WithdrawnAt    string           `json:"withdrawn_at"`
+		State          string           `json:"state"` // repository advisories: published, withdrawn…
 		CVSS           score            `json:"cvss"`
 		CVSSSeverities map[string]score `json:"cvss_severities"`
 		EPSS           struct {
@@ -208,7 +222,7 @@ func parseGitHub(data []byte, keepSeverity func(string) bool) ([]entry, error) {
 	}
 	var out []entry
 	for _, a := range advisories {
-		if !keepSeverity(a.Severity) {
+		if !keepSeverity(a.Severity) || a.WithdrawnAt != "" || a.State == "withdrawn" || a.State == "closed" || notAFlaw(a.Summary) {
 			continue
 		}
 		title := a.Summary
@@ -222,15 +236,40 @@ func parseGitHub(data []byte, keepSeverity func(string) bool) ([]entry, error) {
 		for _, s := range a.CVSSSeverities {
 			e.Score = max(e.Score, s.Score)
 		}
+		if e.Score == 0 {
+			e.Rank = severityRanks[strings.ToLower(a.Severity)] // rated with a word only
+		}
 		for _, v := range a.Vulnerabilities {
-			if v.Package.Name != "" {
-				e.Affected = append(e.Affected, Affected{Package: v.Package.Name, Versions: v.Range, Fixed: cmp.Or(v.FirstPatched, v.Patched)})
+			// A repository advisory may leave the package unnamed: it is then the
+			// repository's own product, which the source's tag names.
+			if v.Package.Name != "" || cveDate && (v.Range != "" || v.Patched != "") {
+				fixed := strings.TrimSpace(cmp.Or(v.FirstPatched, v.Patched))
+				if fixed != "" && !strings.ContainsAny(fixed, "0123456789") {
+					fixed = "" // "TBD": written before the fix, never updated
+				}
+				e.Affected = append(e.Affected, Affected{Package: v.Package.Name, Versions: strings.TrimSpace(v.Range), Fixed: fixed, FixUnknown: fixed == "" && v.Patched != ""})
 			}
 		}
 		e.Published, _ = parseDate(a.PublishedAt)
+		if updated, err := parseDate(a.UpdatedAt); cveDate && err == nil && a.CVE != "" && updated.Sub(e.Published) > 24*time.Hour {
+			e.Title += " [published " + e.Published.Format(time.DateOnly) + ", updated " + updated.Format(time.DateOnly) + "]"
+			e.Published = updated
+		}
 		out = append(out, e)
 	}
 	return out, nil
+}
+
+// severityRanks places the severity words of the advisory databases on the
+// scale of the scores, for the records rated with a word only: unscored, they
+// would otherwise rank as high and push the scored ones out under the cap.
+var severityRanks = map[string]float64{"critical": 9.5, "high": 8, "moderate": 5.5, "medium": 5.5, "low": 2}
+
+// notAFlaw tells the advisories that say they are none: rejected, or a
+// duplicate GitHub keeps for another record of the same flaw.
+func notAFlaw(summary string) bool {
+	s := strings.ToLower(strings.TrimSpace(summary))
+	return strings.HasPrefix(s, "rejected") || strings.HasPrefix(s, "duplicate advisory") || strings.HasPrefix(s, "withdrawn")
 }
 
 // parseKEV reads the CISA Known Exploited Vulnerabilities catalog.
@@ -256,6 +295,7 @@ func parseKEV(data []byte) ([]entry, error) {
 			Title:   fmt.Sprintf("%s exploited in the wild: %s %s, %s", v.CVE, v.Vendor, v.Product, v.Name),
 			URL:     "https://nvd.nist.gov/vuln/detail/" + v.CVE,
 			Summary: clean(v.Description + " Required action: " + v.Action),
+			Product: v.Vendor + "|" + v.Product,
 		}
 		if v.Ransomware == "Known" {
 			e.Summary += " Used in ransomware campaigns."
@@ -267,7 +307,8 @@ func parseKEV(data []byte) ([]entry, error) {
 }
 
 var (
-	tags   = regexp.MustCompile(`(?s)<[^>]*>`)
+	// HTML elements only: a title may write a placeholder ("/web/%2F<domain>").
+	tags   = regexp.MustCompile(`(?is)<!--.*?-->|</?(?:a|abbr|b|blockquote|br|code|dd|del|div|dl|dt|em|h[1-6]|hr|i|img|ins|kbd|li|ol|p|pre|q|s|small|span|strike|strong|sub|sup|table|tbody|td|th|thead|tr|tt|u|ul|figure|figcaption|section|article|header|footer|iframe|picture|source|video|audio|svg|path|font|center|nav|main|aside|time|mark|cite|details|summary|label|input|button|form|script|style|noscript|meta|link)(?:\s[^>]*)?/?>`)
 	spaces = regexp.MustCompile(`\s+`)
 )
 
@@ -315,6 +356,7 @@ func parseNVD(data []byte, cpes map[string]string, lowest float64) ([]entry, err
 			CVE struct {
 				ID           string `json:"id"`
 				Published    string `json:"published"`
+				Status       string `json:"vulnStatus"`
 				Descriptions []struct {
 					Lang  string `json:"lang"`
 					Value string `json:"value"`
@@ -351,7 +393,7 @@ func parseNVD(data []byte, cpes map[string]string, lowest float64) ([]entry, err
 				score = max(score, m.Data.Score)
 			}
 		}
-		if score != 0 && score < lowest {
+		if score != 0 && score < lowest || v.CVE.Status == "Rejected" {
 			continue
 		}
 		var watched, others []Affected
@@ -368,9 +410,14 @@ func parseNVD(data []byte, cpes map[string]string, lowest float64) ([]entry, err
 							bounds = append(bounds, b[0]+b[1])
 						}
 					}
-					a := Affected{Package: parts[4], Versions: strings.Join(bounds, ", "), Fixed: m.EndExcluding}
+					a := Affected{Package: parts[4], Versions: tidyRange(strings.Join(bounds, ", ")), Fixed: m.EndExcluding, FixUnknown: m.EndExcluding == ""}
 					if len(bounds) == 0 && parts[5] != "*" && parts[5] != "-" {
 						a.Versions = parts[5]
+						// The update field names a pre-release (4.2.0:rc1): read as
+						// 4.2.0, it would mark the final release affected.
+						if len(parts) > 6 && parts[6] != "*" && parts[6] != "-" && parts[6] != "" {
+							a.Versions += "-" + parts[6]
+						}
 					}
 					tag, ok := tagOf[parts[3]+":"+parts[4]]
 					if ok {

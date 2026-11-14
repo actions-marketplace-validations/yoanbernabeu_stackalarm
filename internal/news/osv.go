@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	neturl "net/url"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -19,7 +20,7 @@ import (
 // record is downloaded for one ecosystem, and the downloads in flight.
 const (
 	osvBatch       = 500
-	MaxOSVRecords  = 500
+	MaxOSVRecords  = 1500
 	osvConcurrency = 8
 )
 
@@ -29,6 +30,7 @@ type osvQuery struct {
 		Ecosystem string `json:"ecosystem"`
 	} `json:"package"`
 	Version string `json:"version"`
+	From    string `json:"-"` // the SBOM of the component, never sent
 }
 
 // readOSV asks OSV.dev which known vulnerabilities hit the packages given
@@ -47,7 +49,7 @@ func (f *Fetcher) readOSV(ctx context.Context, ecosystem string, packages []stri
 	for _, c := range components {
 		if inEcosystem(c.Ecosystem, ecosystem) {
 			var q osvQuery
-			q.Package.Name, q.Package.Ecosystem, q.Version = c.Name, c.Ecosystem, c.Version
+			q.Package.Name, q.Package.Ecosystem, q.Version, q.From = c.Name, c.Ecosystem, c.Version, c.From
 			queries = append(queries, q)
 		}
 	}
@@ -107,22 +109,38 @@ func (f *Fetcher) readOSV(ctx context.Context, ecosystem string, packages []stri
 		}
 	}
 	if len(order) > MaxOSVRecords {
-		errs = append(errs, fmt.Errorf("partial: %d vulnerabilities hit the %s packages given, only %d read (give fewer packages at a time)", len(order), ecosystem, MaxOSVRecords))
+		errs = append(errs, fmt.Errorf("partial: %d vulnerabilities hit the %s packages given, only %d read (give fewer packages at a time, or one SBOM per run)", len(order), ecosystem, MaxOSVRecords))
 		order = order[:MaxOSVRecords]
 	}
 	var (
 		mu  sync.Mutex
 		wg  sync.WaitGroup
 		sem = make(chan struct{}, osvConcurrency)
-		out = make([]*entry, len(order))
+		out = make([][]entry, len(order))
 	)
 	for i, id := range order {
 		wg.Go(func() {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			data, _, err := f.get(ctx, f.OSVAPI+"/vulns/"+neturl.PathEscape(id), "")
-			if err == nil {
-				out[i], err = parseOSV(data, hits[id], order)
+			// One entry per SBOM: a flaw found in two images is two images to
+			// rebuild, each with its own versions.
+			var groups [][]osvQuery
+			for _, q := range hits[id] {
+				if k := slices.IndexFunc(groups, func(g []osvQuery) bool { return g[0].From == q.From }); k >= 0 {
+					groups[k] = append(groups[k], q)
+				} else {
+					groups = append(groups, []osvQuery{q})
+				}
+			}
+			for _, g := range groups {
+				if err != nil {
+					break
+				}
+				var e *entry
+				if e, err = parseOSV(data, g, order); e != nil {
+					out[i] = append(out[i], *e)
+				}
 			}
 			if err != nil {
 				mu.Lock()
@@ -133,10 +151,8 @@ func (f *Fetcher) readOSV(ctx context.Context, ecosystem string, packages []stri
 	}
 	wg.Wait()
 	var entries []entry
-	for _, e := range out {
-		if e != nil {
-			entries = append(entries, *e)
-		}
+	for _, list := range out {
+		entries = append(entries, list...)
 	}
 	return entries, errors.Join(errs...)
 }
@@ -158,8 +174,13 @@ func parseOSV(data []byte, asked []osvQuery, returned []string) (*entry, error) 
 			Score string `json:"score"`
 		} `json:"severity"`
 		Specific struct {
-			Severity string `json:"severity"`
+			Severity      string `json:"severity"`
+			Informational string `json:"informational"` // RustSec: "unmaintained", "unsound", "notice"
 		} `json:"database_specific"`
+		References []struct {
+			Type string `json:"type"`
+			URL  string `json:"url"`
+		} `json:"references"`
 		Affected []struct {
 			Package struct {
 				Name      string `json:"name"`
@@ -168,6 +189,9 @@ func parseOSV(data []byte, asked []osvQuery, returned []string) (*entry, error) 
 			Specific struct {
 				Urgency string `json:"urgency"` // Debian: "unimportant" is no security issue there
 			} `json:"ecosystem_specific"`
+			DatabaseSpecific struct {
+				Informational string `json:"informational"`
+			} `json:"database_specific"`
 			Ranges []struct {
 				Type   string `json:"type"`
 				Events []struct {
@@ -209,13 +233,36 @@ func parseOSV(data []byte, asked []osvQuery, returned []string) (*entry, error) 
 			break
 		}
 	}
+	// The CVE an advisory is about can be another project's: Next.js bundles
+	// the React code of CVE-2025-55182, and its advisory names that CVE only as
+	// an advisory reference. The lists of exploited flaws know the upstream id.
+	for _, r := range v.References {
+		if r.Type != "ADVISORY" || !upstreamCVELink.MatchString(r.URL) {
+			continue
+		}
+		if c := cveID.FindString(r.URL); c != "" && c != id && !slices.Contains(e.Related, c) {
+			e.Related = append(e.Related, c)
+		}
+	}
 	title := firstNonEmpty(v.Summary, v.Details)
 	if r := []rune(clean(title)); len(r) > 140 {
 		title = string(r[:140]) + "…"
 	}
 	severity := strings.ToLower(cmp.Or(v.Specific.Severity, priority, severityOf(e.Score)))
+	if e.Score == 0 && e.Rank == 0 {
+		e.Rank = severityRanks[severity] // rated with a word only ("LOW"): placed by it under the cap
+	}
 	if strings.HasPrefix(v.ID, "MAL-") { // a version published with malicious code
 		severity, e.Stage = "malware", source.StageAlert
+	}
+	// A RustSec notice that is no vulnerability: a crate unmaintained, renamed.
+	informational := v.Specific.Informational
+	for _, a := range v.Affected {
+		informational = cmp.Or(informational, a.DatabaseSpecific.Informational)
+	}
+	notice := informational == "unmaintained" || informational == "notice"
+	if notice {
+		severity, e.Rank = informational, 0.5 // listed, after the flaws
 	}
 	// A distribution record has no summary, only the text of the CVE: name the
 	// package, and say when the distribution judges the flaw harmless there.
@@ -233,6 +280,12 @@ func parseOSV(data []byte, asked []osvQuery, returned []string) (*entry, error) 
 	}
 	if severity != "" {
 		title = "[" + severity + "] " + title
+	}
+	// Which image to rebuild, when several are checked: its system packages,
+	// and the npm or pip tools it carries, are not the project's lockfile.
+	if len(asked) > 0 && asked[0].From != "" {
+		title = asked[0].From + ", " + title
+		e.Alone, e.Scope = true, asked[0].From
 	}
 	e.Title = clean(title + " (" + id + ")")
 
@@ -255,7 +308,7 @@ func parseOSV(data []byte, asked []osvQuery, returned []string) (*entry, error) 
 						ranges = append(ranges, Affected{Package: q.Package.Name, Versions: osvRange(from, "< "+ev.Fixed), Fixed: ev.Fixed})
 						open = false
 					case ev.LastAffected != "":
-						ranges = append(ranges, Affected{Package: q.Package.Name, Versions: osvRange(from, "<= "+ev.LastAffected)})
+						ranges = append(ranges, Affected{Package: q.Package.Name, Versions: osvRange(from, "<= "+ev.LastAffected), FixUnknown: true}) // the last affected release, not "no fix"
 						open = false
 					}
 				}
@@ -281,10 +334,18 @@ func parseOSV(data []byte, asked []osvQuery, returned []string) (*entry, error) 
 		} else {
 			ranges = slices.DeleteFunc(ranges, func(a Affected) bool { return a.Status == "" }) // the other branches
 		}
+		if notice { // no vulnerability: nothing to fix in the version, the crate is to replace
+			for i := range ranges {
+				ranges[i].Status, ranges[i].Notice = "", true
+			}
+		}
 		e.Affected = append(e.Affected, ranges...)
 	}
 	return &e, nil
 }
+
+// upstreamCVELink is a link to the record of a CVE, at the NVD or the CVE Program.
+var upstreamCVELink = regexp.MustCompile(`^https://(nvd\.nist\.gov/vuln/detail/|www\.cve\.org/CVERecord\?id=)CVE-\d{4}-\d+$`)
 
 // ubuntuPriorities places the priorities Ubuntu gives on the scale of the scores.
 var ubuntuPriorities = map[string]float64{"critical": 9.5, "high": 8, "medium": 5.5, "low": 2, "negligible": 0.5}
@@ -292,12 +353,12 @@ var ubuntuPriorities = map[string]float64{"critical": 9.5, "high": 8, "medium": 
 // osvRange writes ">= 13.0.0, < 13.5.9" from the events of an OSV range.
 func osvRange(introduced, end string) string {
 	if introduced == "" || introduced == "0" {
-		return end
+		return tidyRange(end)
 	}
 	if end == "" {
-		return ">= " + introduced
+		return tidyRange(">= " + introduced)
 	}
-	return ">= " + introduced + ", " + end
+	return tidyRange(">= " + introduced + ", " + end)
 }
 
 func lastFixed(ranges []Affected) string {

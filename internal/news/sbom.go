@@ -18,6 +18,9 @@ type Component struct {
 	Ecosystem string `json:"ecosystem"`
 	Name      string `json:"name"`
 	Version   string `json:"version"`
+	// From names the SBOM the component comes from (its file), so a finding
+	// says which image to rebuild when several are checked.
+	From string `json:"from,omitempty"`
 }
 
 // SBOM is what a software bill of materials gives to look up.
@@ -259,7 +262,21 @@ func fromPURL(purl string, src srcPackage) (Component, string) {
 			version = upVersion
 		}
 	}
+	if isKernel(name) {
+		return Component{}, "kernel packages (a container runs the kernel of its host)"
+	}
 	return Component{Ecosystem: eco, Name: name, Version: version}, ""
+}
+
+// isKernel tells whether a distribution source package is the Linux kernel or
+// its headers. An image carries them for building (linux-libc-dev), but its
+// containers run the host's kernel: its hundreds of flaws are the host's.
+func isKernel(name string) bool {
+	switch name {
+	case "linux", "linux-lts", "linux-headers", "linux-libc-dev", "linux-virt":
+		return true
+	}
+	return strings.HasPrefix(name, "linux-image-") || strings.HasPrefix(name, "linux-signed") || strings.HasPrefix(name, "linux-meta")
 }
 
 // SkippedNote tells in one sentence what an SBOM lists that is not looked

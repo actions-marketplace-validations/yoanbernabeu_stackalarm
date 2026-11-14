@@ -11,14 +11,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	neturl "net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/yoanbernabeu/stackalarm/internal/source"
@@ -48,9 +51,12 @@ type Item struct {
 	PublicExploitIn []string   `json:"public_exploit_in,omitempty"`
 	Affected        []Affected `json:"affected,omitempty"` // packages or products and their versions
 
-	cve  string // CVE id of a CVE database entry, used to merge duplicates
-	dup  string // GHSA id of an advisory without a CVE, used the same way
-	rank int    // order within its source, for the cap
+	cve     string   // CVE id of a CVE database entry, used to merge duplicates
+	related []string // upstream CVEs of the advisory: the lists of exploited flaws may name it by one of them
+	alone   bool     // never merged with another item of its CVE: a KEV alert on a component in use
+	scope   string   // with alone, the SBOM it was found in: merged only with the items of that SBOM
+	dup     string   // GHSA id of an advisory without a CVE, used the same way
+	rank    int      // order within its source, for the cap
 }
 
 // Affected is a package an advisory names, with the vulnerable versions and
@@ -59,17 +65,27 @@ type Affected struct {
 	Package  string `json:"package"`
 	Versions string `json:"versions"`
 	Fixed    string `json:"fixed,omitempty"`
+	// FixUnknown tells that the record names the last affected release, not
+	// the fixed one (the NVD's "<= 1.25.2"): a fix may well exist.
+	FixUnknown bool `json:"fix_unknown,omitempty"`
 	// InUse is the version the query gave for the package, and Status whether
-	// it is in the vulnerable range: StatusAffected or StatusNotAffected. Both
-	// are empty when no version was given or the range could not be read.
+	// it is in the vulnerable range: StatusAffected, StatusPossiblyAffected (a
+	// branch partly in the range) or StatusNotAffected. Both are empty when no
+	// version was given or the range could not be read.
 	InUse  string `json:"in_use,omitempty"`
 	Status string `json:"status,omitempty"`
+	// Notice tells a range of a notice that is no vulnerability (RustSec's
+	// unmaintained crates): InUse is in it, but there is nothing to patch.
+	Notice bool `json:"notice,omitempty"`
 }
 
 // Statuses of a version in use against a vulnerable range.
 const (
 	StatusAffected    = "affected"
 	StatusNotAffected = "not-affected"
+	// StatusPossiblyAffected is a branch (node@20) of which some releases are
+	// in the range and others not: the patch level in use decides.
+	StatusPossiblyAffected = "possibly-affected"
 )
 
 // Failure is a source that could not be read. It is always reported: a
@@ -82,7 +98,11 @@ type Failure struct {
 // Truncation tells that a source had more entries than shown.
 type Truncation struct {
 	Source  string `json:"source"`
-	Dropped int    `json:"dropped"` // the oldest entries left out
+	Dropped int    `json:"dropped"` // the entries ranked last, left out
+	// Packages names the packages in use that lost flaws to the cap, each with
+	// the release fixing all of its flaws listed or not: updating to the fix of
+	// the flaws shown could fall short.
+	Packages []string `json:"packages,omitempty"`
 }
 
 // Result is the outcome of a fetch.
@@ -96,6 +116,9 @@ type Result struct {
 	// Short lists the feeds whose oldest entry is newer than the start of the
 	// period: they keep few entries, so older news may be missing.
 	Short []Coverage `json:"short"`
+	// Exploited tells, for each tag given with its version, what the KEV
+	// catalog holds for it and how much hits the version.
+	Exploited []ExploitedCheck `json:"exploited_checks,omitempty"`
 }
 
 // Coverage tells how far back a feed reaches.
@@ -108,14 +131,43 @@ type Coverage struct {
 // database can return hundreds of records for a common word.
 const MaxPerSource = 30
 
+// MaxOSVPerSource is the cap of an OSV source asked about packages: these are
+// the known flaws of the versions the project locks, each one an update to
+// make, not news to skim.
+const MaxOSVPerSource = 100
+
+// caps gives the sources whose cap is not MaxPerSource.
+//
+// What reads like an audit of the versions in use gets the larger cap: the
+// package databases asked about packages, the NVD records of the releases in
+// use, and the repository advisories of a product given with its version.
+func caps(sources []source.Source, q Query) map[string]int {
+	out := map[string]int{NVDVersionsSource: MaxOSVPerSource}
+	packages := len(allPackages(q)) > 0 || len(q.Components) > 0
+	for _, s := range sources {
+		if _, version := versionOfSource(s, q); s.Type.IsPackageDatabase() && packages || s.Type == source.TypeGitHubAdvisories && version != "" {
+			out[s.ID] = MaxOSVPerSource
+		}
+	}
+	return out
+}
+
 // Query selects what to fetch.
 type Query struct {
-	Tags     []string  // empty: every source
-	Keywords []string  // extra words that select entries of general sources
-	Since    time.Time // entries published before are dropped
+	Tags     []string // empty: every source
+	Keywords []string // extra words that select entries of general sources
+	// Order lists the tags and keywords in the order they were given, mixed:
+	// the CVE databases are searched for the first MaxTerms of them. Empty:
+	// the tags, then the keywords.
+	Order []string
+	Since time.Time // entries published before are dropped
 	// Packages narrow the GitHub Advisory Database sources to these package
 	// names (the agent reads them from the lockfile). Empty: the whole ecosystem.
 	Packages []string
+	// PackagesIn holds the packages given with an ecosystem (pip:redis@4.5.1),
+	// by ecosystem as normalEcosystem writes it: only that ecosystem's sources
+	// read them. The packages without one are in Packages and not here.
+	PackagesIn map[string][]string
 	// Versions gives the version in use of a tag (php: 8.3.20). It never
 	// filters: the ranges of the CVE records are compared with it.
 	Versions map[string]string
@@ -140,15 +192,22 @@ type Fetcher struct {
 	CVEAPI      string        // CVE Program API, for the record of one CVE
 	NVDDelay    time.Duration // pause between two NVD requests (the API allows 5 per 30 s without key)
 	EUVDDelay   time.Duration // pause between two EUVD search requests, which answer HTTP 429 to bursts
+	RetryDelay  time.Duration // pause before trying an NVD request again, doubled the second time
 	CacheDir    string        // empty disables the cache
 	CacheTTL    time.Duration // how long a cached response is reused
 	Search      source.Search // how tags become CVE database search terms
 	Now         func() time.Time
 
 	github chan struct{} // bounds the GitHub requests in flight
+	// nvdRejected is set when the NVD refuses NVD_API_KEY: the requests then go
+	// without it. A pointer, so the copies of a Fetcher share it.
+	nvdRejected *atomic.Bool
 	// The pauses between two requests to the NVD and the EUVD, kept from one
 	// Fetch to the next: a program that fetches tag after tag stays in the limits.
 	nvdGate, euvdGate *gate
+	// noProduct holds the words given with a release that have no NVD product:
+	// their records were not compared. Set by nvdKnown, read once it is done.
+	noProduct map[string]bool
 }
 
 // GitHubConcurrency bounds the GitHub requests in flight: beyond, its
@@ -156,36 +215,77 @@ type Fetcher struct {
 const GitHubConcurrency = 16
 
 // Fetch reads the sources selected by q, in parallel.
-func (f *Fetcher) Fetch(ctx context.Context, sources []source.Source, q Query) Result {
+func (f *Fetcher) Fetch(ctx context.Context, sources []source.Source, q Query) (res Result) {
+	given := q.Versions
+	q.Versions = releasesOf(q.Versions)
+	defer func() { restoreVersions(&res, given, q.Versions) }()
 	selected := selectSources(sources, q.Tags)
+	if len(q.Tags) == 0 && len(q.Keywords) > 0 {
+		// Keywords alone search the general sources: no technology was named,
+		// and every source of every technology would bury them.
+		selected = slices.DeleteFunc(slices.Clone(sources), func(s source.Source) bool { return !s.IsGeneral() })
+	}
 	if q.ComponentsOnly {
 		selected = nil
 	}
 	for _, s := range sources {
 		marks := s.Type == source.TypeKEV || s.Type == source.TypeEUVD && s.Stage == source.StageAlert || s.Type.IsExploitCatalog()
-		inSBOM := s.Type == source.TypeOSV && slices.ContainsFunc(q.Components, func(c Component) bool { return inEcosystem(c.Ecosystem, s.Ecosystem) })
+		inSBOM := slices.ContainsFunc(q.Components, func(c Component) bool {
+			switch s.Type {
+			case source.TypeOSV:
+				return inEcosystem(c.Ecosystem, s.Ecosystem)
+			case source.TypePackagist:
+				return c.Ecosystem == "Packagist"
+			case source.TypeRubySec:
+				return c.Ecosystem == "RubyGems"
+			}
+			return false
+		})
 		if (inSBOM || marks && q.ComponentsOnly) && !slices.ContainsFunc(selected, func(o source.Source) bool { return o.ID == s.ID }) {
 			selected = append(selected, s)
 		}
 	}
 	f.github = make(chan struct{}, GitHubConcurrency)
+	if f.nvdRejected == nil {
+		f.nvdRejected = new(atomic.Bool)
+	}
 	terms, left := searchTerms(q, f.Search)
-	words := matchers(matchTerms(q, f.Search))
+	matched := matchTerms(q, f.Search)
+	words := matchers(matched)
+	precise := f.preciseTerms(q, matched)
 	if f.nvdGate == nil {
 		f.nvdGate, f.euvdGate = &gate{delay: f.NVDDelay}, &gate{delay: f.EUVDDelay}
 	}
 	nvd, euvd := f.nvdGate, f.euvdGate
 	exploited := map[string][]string{} // CVE: the sources reporting it exploited
 	exploits := map[string][]string{}  // CVE: the catalogs holding a public exploit
+	var (
+		kevSource  source.Source
+		kevCatalog []entry // the whole catalog, whatever the dates: searched for the versions in use
+	)
 
 	var (
-		mu  sync.Mutex
-		res = Result{Items: []Item{}, Failures: []Failure{}, Truncated: []Truncation{}, NotSearched: []string{}, Short: []Coverage{}}
-		wg  sync.WaitGroup
+		mu sync.Mutex
+		wg sync.WaitGroup
 	)
+	res = Result{Items: []Item{}, Failures: []Failure{}, Truncated: []Truncation{}, NotSearched: []string{}, Short: []Coverage{}}
 	if slices.ContainsFunc(selected, func(s source.Source) bool { return s.Type.IsSearch() }) {
 		res.NotSearched = append(res.NotSearched, left...)
 	}
+	// The KEV flaws of the products given with a version, alongside the sources.
+	var (
+		kevNVD     map[string]map[string][]Affected
+		nvdRecords map[string][]entry
+		kevFailed  map[string]bool
+		kevErr     error
+		kevDone    = make(chan struct{})
+	)
+	go func() {
+		defer close(kevDone)
+		if !q.ComponentsOnly && len(q.Versions) > 0 && slices.ContainsFunc(selected, func(s source.Source) bool { return s.Type == source.TypeKEV }) {
+			kevNVD, nvdRecords, kevFailed, kevErr = f.nvdKnown(ctx, selected, q, nvd)
+		}
+	}()
 	for _, s := range selected {
 		if s.Type.IsSearch() && len(terms.words) == 0 && (s.Type != source.TypeNVD || len(terms.cpes) == 0) {
 			continue // nothing to search for
@@ -200,6 +300,9 @@ func (f *Fetcher) Fetch(ctx context.Context, sources []source.Source, q Query) R
 			if oldest := oldestEntry(entries); s.Type == source.TypeFeed && err == nil && oldest.After(q.Since) {
 				res.Short = append(res.Short, Coverage{Source: s.ID, Since: oldest})
 			}
+			if s.Type == source.TypeKEV {
+				kevSource, kevCatalog = s, slices.Clone(entries)
+			}
 			for _, e := range entries { // the whole catalog, before the date and word filters
 				if e.Exploit {
 					if c := cveID.FindString(e.Title); c != "" && !slices.Contains(exploits[c], s.ID) {
@@ -213,7 +316,7 @@ func (f *Fetcher) Fetch(ctx context.Context, sources []source.Source, q Query) R
 				}
 			}
 			entries = slices.DeleteFunc(entries, func(e entry) bool {
-				if q.ComponentsOnly && s.Type != source.TypeOSV {
+				if q.ComponentsOnly && !s.Type.IsPackageDatabase() {
 					return true // read for its marks only
 				}
 				if e.Published.IsZero() || !e.Current && e.Published.Before(q.Since) {
@@ -224,12 +327,29 @@ func (f *Fetcher) Fetch(ctx context.Context, sources []source.Source, q Query) R
 						return false // found by product, not by word
 					}
 					text := matchText(e)
-					return !slices.ContainsFunc(words, func(re *regexp.Regexp) bool { return re.MatchString(text) })
+					for i, re := range words {
+						if !re.MatchString(text) {
+							continue
+						}
+						// A tag with a version and a product of the dictionary keeps
+						// the NVD records of its product, and the fresh ones not yet
+						// tied to any: the others only share its name ("php" in a
+						// WordPress plugin). The EUVD names no product: the NVD covers it.
+						names, ok := precise[matched[i]]
+						if !ok || s.Type == source.TypeNVD && (names == nil || len(e.Affected) == 0 || slices.ContainsFunc(e.Affected, func(a Affected) bool { return slices.Contains(names, normalName(a.Package)) })) {
+							return false
+						}
+					}
+					return true
 				}
 				return !keep(s, e, words)
 			})
+			if s.Type == source.TypeNVD && len(precise) > 0 {
+				entries = f.freshOfProducts(ctx, entries, q, precise, matched, words)
+			}
+			products := s.Type.IsSearch() || s.Type == source.TypeNVDProduct || s.Type == source.TypeFeed
 			for i := range entries {
-				entries[i].Affected = annotate(entries[i].Affected, q)
+				entries[i].Affected = annotate(entries[i].Affected, q, products)
 			}
 			slices.SortStableFunc(entries, func(a, b entry) int {
 				// What a version in use proves, then the records of a watched
@@ -237,18 +357,22 @@ func (f *Fetcher) Fetch(ctx context.Context, sources []source.Source, q Query) R
 				if c := cmp.Compare(relevance(a, q), relevance(b, q)); c != 0 {
 					return c
 				}
-				if s.Type == source.TypeOSV { // what an update fixes today, before what has no fix yet
+				if s.Type.IsPackageDatabase() { // what an update fixes today, before what has no fix yet
 					if c := cmp.Compare(fixable(b), fixable(a)); c != 0 {
 						return c
 					}
 				}
-				if s.Type.IsSearch() || s.Type == source.TypeNVDProduct || s.Type == source.TypeGitHubAdvisoryDatabase || s.Type == source.TypeOSV { // most severe first, so the cap drops the minor ones
-					if c := cmp.Compare(priority(b), priority(a)); c != 0 {
+				if s.Type.IsSearch() || s.Type == source.TypeNVDProduct || s.Type == source.TypeGitHubAdvisoryDatabase || s.Type.IsPackageDatabase() || s.Type == source.TypeGitHubAdvisories { // most severe first, so the cap drops the minor ones
+					pkg := s.Type.IsPackageDatabase() || s.Type == source.TypeGitHubAdvisoryDatabase || s.Type == source.TypeGitHubAdvisories
+					if c := cmp.Compare(priority(b, pkg), priority(a, pkg)); c != 0 {
 						return c
 					}
 				}
 				return b.Published.Compare(a.Published)
 			})
+			if s.Type.IsPackageDatabase() {
+				entries = inTurns(entries, isDistribution(s.Ecosystem))
+			}
 			for rank, e := range entries {
 				stage := cmp.Or(e.Stage, s.Stage)
 				if stage == source.StageHeadsUp && releasedTitle.MatchString(e.Title) {
@@ -257,10 +381,14 @@ func (f *Fetcher) Fetch(ctx context.Context, sources []source.Source, q Query) R
 				item := Item{
 					Source: s.ID, Tags: s.Tags, Stage: stage, Title: e.Title, URL: absolute(s.URL, e.URL),
 					Published: e.Published, Summary: e.Summary, Score: e.Score, Language: s.Language, EPSS: e.EPSS, Affected: e.Affected,
+					related: e.Related, alone: e.Alone, scope: e.Scope,
 				}
-				if mergeable(s.Type) {
-					item.cve = cveID.FindString(e.Title)
-					item.dup = ghsaID.FindString(e.Title + " " + e.URL)
+				if mergeable(s.Type) || s.Type == source.TypeEUVD && s.Stage == source.StageAdvisory ||
+					s.Type == source.TypeFeed && s.Stage == source.StageAdvisory && len(cveID.FindAllString(e.Title, -1)) == 1 {
+					// A vendor's advisory feed naming one CVE is the same flaw as its
+					// database records: one line, the others listed under "also in".
+					item.cve = titleCVE(e.Title)
+					item.dup = advisoryGHSA(e)
 				}
 				item.ID = itemID(item)
 				item.rank = rank
@@ -269,20 +397,56 @@ func (f *Fetcher) Fetch(ctx context.Context, sources []source.Source, q Query) R
 		})
 	}
 	wg.Wait()
+	<-kevDone
+	if kevErr != nil {
+		res.Failures = append(res.Failures, Failure{Source: "nvd-versions", Error: "the flaws exploited or exploitable on the versions given may be missing: " + kevErr.Error()})
+	}
+	if !q.ComponentsOnly {
+		found, checks := f.kevInUse(ctx, kevSource, kevCatalog, q, sources, nvd, kevNVD, res.Items)
+		for i := range checks {
+			if kevFailed[checks[i].Tag] {
+				checks[i].Incomplete = true
+			}
+			checks[i].NoProduct = f.noProduct[checks[i].Tag]
+		}
+		res.Items, res.Exploited = append(res.Items, found...), checks
+		if i := slices.IndexFunc(selected, func(s source.Source) bool { return s.Type == source.TypeNVD }); i >= 0 {
+			res.Items = append(res.Items, knownInUse(nvdRecords, q, exploits, exploited, selected[i])...)
+		}
+	}
 	slices.SortFunc(res.Items, func(a, b Item) int {
 		return cmp.Or(b.Published.Compare(a.Published), cmp.Compare(a.Source, b.Source), cmp.Compare(a.Title, b.Title))
 	})
 	for i, it := range res.Items {
-		if sources := exploited[it.cve]; it.cve != "" && len(sources) > 0 {
-			res.Items[i].ExploitedIn = slices.Sorted(slices.Values(sources))
+		var lists, catalogs []string
+		for _, c := range append([]string{it.cve}, it.related...) {
+			if c == "" {
+				continue
+			}
+			for _, s := range exploited[c] {
+				if !slices.Contains(lists, s) {
+					lists = append(lists, s)
+				}
+			}
+			for _, s := range exploits[c] {
+				if !slices.Contains(catalogs, s) {
+					catalogs = append(catalogs, s)
+				}
+			}
+		}
+		if len(lists) > 0 {
+			res.Items[i].ExploitedIn = slices.Sorted(slices.Values(lists))
 			res.Items[i].rank -= 1 << 20 // kept first under the cap
 		}
-		if catalogs := exploits[it.cve]; it.cve != "" && len(catalogs) > 0 {
+		if len(catalogs) > 0 {
 			res.Items[i].PublicExploitIn = slices.Sorted(slices.Values(catalogs))
 			res.Items[i].rank -= 1 << 19 // then the ones anyone can exploit
 		}
 	}
-	res.Items, res.Truncated = mergeAndCap(res.Items)
+	if f.nvdKeyRejected() {
+		res.Failures = append(res.Failures, Failure{Source: "nvd-api-key", Error: NVDKeyRejected})
+	}
+	res.Items, res.Truncated = mergeAndCap(res.Items, caps(selected, q))
 	if err := f.addEPSS(ctx, res.Items); err != nil {
 		res.Failures = append(res.Failures, Failure{Source: "epss", Error: err.Error()})
 	}
@@ -306,12 +470,265 @@ var (
 	ghsaID         = regexp.MustCompile(`GHSA(-[23456789cfghjmpqrvwx]{4}){3}`)
 )
 
+// inTurns orders sorted OSV entries package by package, in turns: the most
+// severe flaw of each package, then the second of each, and so on. The cap of
+// a source then drops the minor flaws of the most exposed packages, never a
+// whole package: a lockfile with one package holding forty advisories would
+// otherwise hide every other package.
+//
+// Turns are taken tier by tier: the high and critical flaws of every package
+// before the moderate ones, those before the low ones; what a distribution
+// rates harmless, or a notice that is no flaw (a crate unmaintained), after
+// every real flaw; for the system packages of an image, which carry hundreds
+// of flaws no release fixes yet, what an update fixes today before those.
+func inTurns(entries []entry, distribution bool) []entry {
+	tier := func(e entry) int {
+		if e.Rank > 0 && e.Rank < 1 {
+			return 6
+		}
+		t := 2 // severity first: every high flaw before any low one
+		switch p := priority(e, true); {
+		case p >= 7:
+			t = 0
+		case p >= 4:
+			t = 1
+		}
+		if distribution && fixable(e) == 0 {
+			t += 3
+		}
+		return t
+	}
+	var out []entry
+	for t := range 7 {
+		var group []entry
+		for _, e := range entries {
+			if tier(e) == t {
+				group = append(group, e)
+			}
+		}
+		out = append(out, turns(group)...)
+	}
+	return out
+}
+
+func turns(entries []entry) []entry {
+	var (
+		order []string
+		lists = map[string][]entry{}
+	)
+	for _, e := range entries {
+		key := ""
+		for _, a := range e.Affected {
+			if key == "" || a.Status == StatusAffected {
+				key = a.Package
+			}
+			if a.Status == StatusAffected {
+				break
+			}
+		}
+		if _, seen := lists[key]; !seen {
+			order = append(order, key)
+		}
+		lists[key] = append(lists[key], e)
+	}
+	out := make([]entry, 0, len(entries))
+	for turn := 0; len(out) < len(entries); turn++ {
+		for _, key := range order {
+			if turn < len(lists[key]) {
+				out = append(out, lists[key][turn])
+			}
+		}
+	}
+	return out
+}
+
+// restoreVersions writes back the versions as they were given (16.11, not
+// the 16.11.0 compared).
+func restoreVersions(res *Result, given, compared map[string]string) {
+	back := map[string]string{}
+	for tag, v := range compared {
+		if given[tag] != v {
+			back[v] = given[tag]
+		}
+	}
+	if len(back) == 0 {
+		return
+	}
+	for i := range res.Items {
+		for j, a := range res.Items[i].Affected {
+			if v, ok := back[a.InUse]; ok {
+				res.Items[i].Affected[j].InUse = v
+			}
+		}
+	}
+	for i, c := range res.Exploited {
+		if v, ok := back[c.Version]; ok {
+			res.Exploited[i].Version = v
+		}
+	}
+	for i, t := range res.Truncated {
+		for j, p := range t.Packages {
+			for norm, v := range back {
+				res.Truncated[i].Packages[j] = strings.Replace(p, "@"+norm+" ", "@"+v+" ", 1)
+			}
+		}
+	}
+}
+
+// twoPartReleases are the products whose releases have two parts since a
+// major version: PostgreSQL 16.11 is a release, not a branch.
+var twoPartReleases = map[string]int{"postgresql": 10, "postgres": 10}
+
+// releasesOf writes the two-part releases of those products with three parts
+// (16.11 as 16.11.0), so they are compared as releases.
+func releasesOf(versions map[string]string) map[string]string {
+	out := map[string]string{}
+	for tag, v := range versions {
+		out[tag] = v
+		if since, ok := twoPartReleases[tag]; ok && isBranch(v) && strings.Count(v, ".") == 1 {
+			if major, err := strconv.Atoi(strings.TrimPrefix(v[:strings.Index(v, ".")], "v")); err == nil && major >= since {
+				out[tag] = v + ".0"
+			}
+		}
+	}
+	return out
+}
+
+// goToolchain adds the Go release in use, from the go tag or the stdlib
+// package, as both packages OSV files its flaws under: stdlib (the standard
+// library, in every binary) and toolchain (cmd/go, cgo, the linker, which
+// run at build time).
+func goToolchain(packages []string, tagVersion string) []string {
+	version := strings.TrimPrefix(tagVersion, "go")
+	for _, p := range packages {
+		if packageName(p) == "stdlib" || packageName(p) == "toolchain" {
+			version = cmp.Or(strings.TrimPrefix(strings.TrimPrefix(p, packageName(p)+"@"), "go"), version)
+		}
+	}
+	if version == "" || isBranch(version) { // go@1.25: no release to ask about
+		return packages
+	}
+	out := slices.Clone(packages)
+	for _, name := range []string{"stdlib", "toolchain"} {
+		if !slices.ContainsFunc(out, func(p string) bool { return packageName(p) == name }) {
+			out = append(out, name+"@"+version)
+		}
+	}
+	return out
+}
+
+// ghsaAffectsLength bounds the packages of one GitHub Advisory Database
+// request, written in its URL.
+const ghsaAffectsLength = 3000
+
+// urlBatches splits values into batches whose comma-joined length stays
+// under limit, in their order.
+func urlBatches(values []string, limit int) [][]string {
+	var (
+		out  [][]string
+		cur  []string
+		size int
+	)
+	for _, v := range values {
+		if len(cur) > 0 && size+len(v)+1 > limit {
+			out, cur, size = append(out, cur), nil, 0
+		}
+		cur, size = append(cur, v), size+len(v)+1
+	}
+	if len(cur) > 0 {
+		out = append(out, cur)
+	}
+	return out
+}
+
+// allPackages gives every package given, with an ecosystem or not.
+func allPackages(q Query) []string {
+	out := slices.Clone(q.Packages)
+	for _, e := range slices.Sorted(maps.Keys(q.PackagesIn)) {
+		out = append(out, q.PackagesIn[e]...)
+	}
+	return out
+}
+
+// versionOfSource gives the first tag of a source given with a version.
+func versionOfSource(s source.Source, q Query) (tag, version string) {
+	for _, t := range s.Tags {
+		if v := q.Versions[t]; v != "" {
+			return t, v
+		}
+	}
+	return "", ""
+}
+
+// packagesFor gives the packages a source of an ecosystem reads: those given
+// without an ecosystem, and those given with this one.
+func packagesFor(q Query, ecosystem string) []string {
+	return append(slices.Clone(q.Packages), q.PackagesIn[NormalEcosystem(ecosystem)]...)
+}
+
+// normalEcosystem writes the names of an ecosystem one way, those of the
+// GitHub Advisory Database: PyPI and python are pip, Packagist is composer.
+func NormalEcosystem(e string) string {
+	e = strings.ToLower(strings.TrimSpace(e))
+	if n, ok := ecosystemNames[e]; ok {
+		return n
+	}
+	return e
+}
+
+var ecosystemNames = map[string]string{
+	"pypi": "pip", "packagist": "composer", "gem": "rubygems", "gems": "rubygems", "crates.io": "rust", "cargo": "rust",
+	"golang": "go", "github actions": "actions", "github-actions": "actions", "hex": "erlang", "swifturl": "swift",
+}
+
+// withComponents adds to the packages given the components of an SBOM in one
+// ecosystem, as name@version.
+func withComponents(packages []string, components []Component, ecosystem string) []string {
+	out := slices.Clone(packages)
+	for _, c := range components {
+		if p := c.Name + "@" + c.Version; c.Ecosystem == ecosystem && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// titleCVE gives the CVE a title is about: the one it starts with (a KEV
+// alert), otherwise the last one, the id written at its end. A title can
+// name another CVE before its own ("incomplete fix for CVE-2024-45411
+// (CVE-2026-46638)"), and taking that one merged two flaws into one.
+func titleCVE(title string) string {
+	ids := cveID.FindAllString(title, -1)
+	switch {
+	case len(ids) == 0:
+		return ""
+	case strings.HasPrefix(title, ids[0]):
+		return ids[0]
+	}
+	return ids[len(ids)-1]
+}
+
+// advisoryGHSA gives the GHSA id an entry is about: the one of its link, or
+// the last one of its title. A title can name an earlier advisory first
+// ("incomplete fix of GHSA-jjxg-p3v6-52ww"), and taking that one merged two
+// advisories into one.
+func advisoryGHSA(e entry) string {
+	if id := ghsaID.FindString(e.URL); id != "" {
+		return id
+	}
+	ids := ghsaID.FindAllString(e.Title, -1)
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[len(ids)-1]
+}
+
 // mergeable tells whether the entries of a source are vulnerability records
 // that other databases may repeat. Alerts (KEV, exploited lists) and feeds are
 // never merged: their own wording carries information.
 func mergeable(t source.Type) bool {
 	switch t {
-	case source.TypeNVD, source.TypeNVDProduct, source.TypeEUVDSearch, source.TypeGitHubAdvisories, source.TypeGitHubAdvisoryDatabase, source.TypeOSV:
+	case source.TypeNVD, source.TypeNVDProduct, source.TypeEUVDSearch, source.TypeGitHubAdvisories, source.TypeGitHubAdvisoryDatabase, source.TypeOSV, source.TypePackagist, source.TypeRubySec:
 		return true
 	}
 	return false
@@ -336,10 +753,17 @@ func (f *Fetcher) addEPSS(ctx context.Context, items []Item) error {
 	if f.EPSSAPI == "" {
 		return nil
 	}
+	// An advisory without a CVE of its own is scored by its upstream CVE.
+	scored := func(it Item) string {
+		if it.cve == "" && len(it.related) > 0 {
+			return it.related[0]
+		}
+		return it.cve
+	}
 	var cves []string
 	for _, it := range items {
-		if it.cve != "" && it.EPSS == 0 {
-			cves = append(cves, it.cve)
+		if c := scored(it); c != "" && it.EPSS == 0 {
+			cves = append(cves, c)
 		}
 	}
 	slices.Sort(cves) // a stable URL, for the cache
@@ -367,7 +791,7 @@ func (f *Fetcher) addEPSS(ctx context.Context, items []Item) error {
 	}
 	for i := range items {
 		if items[i].EPSS == 0 {
-			items[i].EPSS = scores[items[i].cve]
+			items[i].EPSS = scores[scored(items[i])]
 		}
 	}
 	return nil
@@ -389,10 +813,12 @@ func statusOrder(status string) int {
 	switch status {
 	case StatusAffected:
 		return 0
+	case StatusPossiblyAffected:
+		return 1
 	case StatusNotAffected:
-		return 2
+		return 3
 	}
-	return 1
+	return 2
 }
 
 // relevance orders the entries of one source: 0 when a version in use is in
@@ -405,7 +831,7 @@ func relevance(e entry, q Query) int {
 	}
 	for _, a := range e.Affected {
 		switch {
-		case a.Status == StatusAffected:
+		case a.Status == StatusAffected, a.Status == StatusPossiblyAffected:
 			return 0
 		case slices.Contains(q.Tags, strings.ToLower(a.Package)), slices.ContainsFunc(q.Packages, func(p string) bool { return packageName(p) == a.Package }):
 			r = 1
@@ -417,29 +843,93 @@ func relevance(e entry, q Query) int {
 // annotate compares each range with the version in use, when the query gives
 // one (a package with its version, or the version of a tag), then puts the
 // ranges that matter first.
-func annotate(affected []Affected, q Query) []Affected {
+//
+// products tells that the ranges name products (the NVD, the CVE Program),
+// not packages: only the versions of the tags count then. The MongoDB server
+// and its Node.js driver both go by "mongodb", with versions of their own.
+func annotate(affected []Affected, q Query, products bool) []Affected {
 	for i, a := range affected {
-		if a.Status != "" {
+		if a.Status != "" || a.Notice {
 			continue // the source already told
 		}
 		version := q.Versions[strings.ToLower(a.Package)]
-		for _, p := range q.Packages {
-			if packageName(p) == a.Package {
+		for _, p := range allPackages(q) {
+			if !products && packageName(p) == a.Package {
 				_, version, _ = strings.Cut(strings.TrimPrefix(p, a.Package), "@")
 			}
 		}
-		if in, ok := inRange(version, a.Versions); ok {
-			affected[i].InUse, affected[i].Status = version, StatusNotAffected
-			if in {
-				affected[i].Status = StatusAffected
-			}
+		if status, ok := statusOf(version, a); ok {
+			affected[i].InUse, affected[i].Status = version, status
 		}
 	}
-	watched := slices.Clone(q.Packages)
+	branchwise(affected)
+	watched := allPackages(q)
 	for name, version := range q.Versions {
 		watched = append(watched, name+"@"+version)
 	}
 	return watchedFirst(affected, watched)
+}
+
+// lockedVersions gives the versions of a package among those given.
+func lockedVersions(pkg string, given []string) []string {
+	var out []string
+	for _, p := range given {
+		if name := packageName(p); name != p && strings.EqualFold(name, pkg) {
+			out = append(out, strings.TrimPrefix(p, name+"@"))
+		}
+	}
+	return out
+}
+
+// unlisted tells that a package of a repository advisory is a component the
+// lockfile given does not hold: symfony/mime when other symfony/ packages are
+// given, but not it. Its range then says nothing of the project.
+func unlisted(pkg string, given []string) bool {
+	owner, _, ok := strings.Cut(pkg, "/")
+	if !ok || len(given) == 0 {
+		return false
+	}
+	sameOwner := false
+	for _, p := range given {
+		name := packageName(p)
+		if strings.EqualFold(name, pkg) {
+			return false
+		}
+		if o, _, ok := strings.Cut(name, "/"); ok && strings.EqualFold(o, owner) {
+			sameOwner = true
+		}
+	}
+	return sameOwner
+}
+
+// branchwise reads the ranges an advisory gives branch by branch for one
+// package ("< 8.3.32", "< 8.4.21", "< 8.5.6"): the range ending on the branch
+// of the version in use decides, and the ranges of the other branches no
+// longer mark it. 8.4.27 is fixed by 8.4.21, whatever "< 8.5.6" says.
+func branchwise(affected []Affected) {
+	upper := func(rng string) string { // the release an upper bound names
+		for _, c := range strings.Split(rng, ",") {
+			if v, ok := strings.CutPrefix(strings.TrimSpace(c), "<"); ok {
+				return strings.TrimPrefix(strings.TrimSpace(strings.TrimPrefix(v, "=")), "v")
+			}
+		}
+		return ""
+	}
+	for i, a := range affected {
+		if a.Status != StatusAffected || isBranch(a.InUse) {
+			continue
+		}
+		if b := upper(a.Versions); b == "" || branchOfRelease(b) == branchOfRelease(a.InUse) {
+			continue
+		}
+		if slices.ContainsFunc(affected, func(o Affected) bool {
+			b := upper(o.Versions)
+			return o.Status == StatusNotAffected && o.InUse == a.InUse && normalName(o.Package) == normalName(a.Package) &&
+				b != "" && branchOfRelease(b) == branchOfRelease(a.InUse)
+		}) {
+			affected[i].Status = StatusNotAffected
+		}
+	}
 }
 
 // watchedFirst puts the packages the query names first, and among them the
@@ -455,9 +945,9 @@ func watchedFirst(affected []Affected, packages []string) []Affected {
 				return 0
 			}
 			_, version, _ := strings.Cut(strings.TrimPrefix(p, a.Package), "@") // empty without a version
-			in, ok := inRange(version, a.Versions)
+			status, ok := statusOf(version, a)
 			switch {
-			case in:
+			case status == StatusAffected, status == StatusPossiblyAffected:
 				return 0
 			case !ok:
 				return 1
@@ -485,10 +975,48 @@ func packageName(p string) string {
 // severe first for CVE databases). A merged CVE takes one place, in the
 // source that ranks it highest, or in another listing it when that source
 // is full: a CVE is dropped only when no source has room for it.
-func mergeAndCap(items []Item) ([]Item, []Truncation) {
+func mergeAndCap(items []Item, caps map[string]int) ([]Item, []Truncation) {
+	limit := func(src string) int {
+		if n, ok := caps[src]; ok {
+			return n
+		}
+		return MaxPerSource
+	}
+	// Items sharing a CVE or a GHSA id are one flaw: a GHSA filed under two
+	// CVEs by two databases, a RubySec record named by its GHSA. An item kept
+	// alone (a KEV alert) is merged with nothing; one of an image only with the
+	// items of that image.
+	parent := map[string]string{}
+	var find func(string) string
+	find = func(x string) string {
+		if p, ok := parent[x]; ok && p != x {
+			parent[x] = find(p)
+			return parent[x]
+		}
+		parent[x] = x
+		return x
+	}
+	ids := func(i int) []string {
+		it := items[i]
+		if it.alone && it.scope == "" {
+			return nil
+		}
+		var out []string
+		for _, k := range []string{it.cve, it.dup} {
+			if k != "" {
+				out = append(out, it.scope+"|"+k)
+			}
+		}
+		return out
+	}
+	for i := range items {
+		if ks := ids(i); len(ks) > 1 {
+			parent[find(ks[1])] = find(ks[0])
+		}
+	}
 	key := func(i int) string {
-		if k := cmp.Or(items[i].cve, items[i].dup); k != "" {
-			return k
+		if ks := ids(i); len(ks) > 0 {
+			return find(ks[0])
 		}
 		return fmt.Sprint("#", i)
 	}
@@ -516,11 +1044,11 @@ func mergeAndCap(items []Item) ([]Item, []Truncation) {
 	slices.SortStableFunc(byRank, func(a, b string) int { return cmp.Compare(items[owner[b]].rank, items[owner[a]].rank) })
 	for _, k := range byRank {
 		src := items[owner[k]].Source
-		if count[src] <= MaxPerSource {
+		if count[src] <= limit(src) {
 			continue
 		}
 		for _, h := range holders[k] {
-			if other := items[h].Source; other != src && count[other] < MaxPerSource {
+			if other := items[h].Source; other != src && count[other] < limit(other) {
 				owner[k] = h
 				count[src]--
 				count[other]++
@@ -538,14 +1066,14 @@ func mergeAndCap(items []Item) ([]Item, []Truncation) {
 		truncated []Truncation
 	)
 	for src, ks := range owned {
-		if len(ks) <= MaxPerSource {
+		if len(ks) <= limit(src) {
 			continue
 		}
 		slices.SortStableFunc(ks, func(a, b string) int { return cmp.Compare(items[owner[a]].rank, items[owner[b]].rank) })
-		for _, k := range ks[MaxPerSource:] {
+		for _, k := range ks[limit(src):] {
 			dropped[k] = true
 		}
-		truncated = append(truncated, Truncation{Source: src, Dropped: len(ks) - MaxPerSource})
+		truncated = append(truncated, Truncation{Source: src, Dropped: len(ks) - limit(src), Packages: lostPackages(items, owner, ks, limit(src))})
 	}
 	var out []Item
 	for _, k := range keys {
@@ -565,12 +1093,54 @@ func mergeAndCap(items []Item) ([]Item, []Truncation) {
 				}
 			}
 		}
+		branchwise(it.Affected) // the databases may give the ranges of one package's branches apart
 		slices.SortStableFunc(it.Affected, func(a, b Affected) int {
 			return cmp.Compare(statusOrder(a.Status), statusOrder(b.Status))
 		})
 		out = append(out, it)
 	}
 	return out, truncated
+}
+
+// maxLostPackages bounds the packages a truncation names.
+const maxLostPackages = 12
+
+// lostPackages names the packages in use with flaws among the keys left out
+// (ks[kept:]), each with the highest fixed release among all its flaws.
+func lostPackages(items []Item, owner map[string]int, ks []string, kept int) []string {
+	fix := map[string]string{} // package@version: the highest fix of its flaws
+	lost := map[string]bool{}
+	var order []string
+	for n, k := range ks {
+		for _, a := range items[owner[k]].Affected {
+			if a.Status != StatusAffected || a.InUse == "" {
+				continue
+			}
+			p := a.Package + "@" + a.InUse
+			if _, seen := fix[p]; !seen {
+				fix[p] = ""
+			}
+			if a.Fixed != "" && (fix[p] == "" || compareVersions(a.Fixed, fix[p]) > 0) {
+				fix[p] = a.Fixed
+			}
+			if n >= kept && !lost[p] {
+				lost[p] = true
+				order = append(order, p)
+			}
+		}
+	}
+	var out []string
+	for _, p := range order[:min(len(order), maxLostPackages)] {
+		if fix[p] != "" {
+			out = append(out, p+" (all its flaws fixed in "+fix[p]+")")
+		} else {
+			out = append(out, p)
+		}
+	}
+	if len(order) > maxLostPackages {
+		out = append(out, fmt.Sprintf("and %d more packages", len(order)-maxLostPackages))
+	}
+	return out
 }
 
 // itemID identifies an item by its CVE when databases may merge it (the one
@@ -642,7 +1212,12 @@ func matchers(words []string) []*regexp.Regexp {
 }
 
 // priority ranks an unscored CVE as high: fresh CVEs wait days for a score.
-func priority(e entry) float64 {
+// An advisory of a package database without a score nor a severity word is
+// placed in the middle: ranked high, it pushed the scored high ones out.
+func priority(e entry, packages bool) float64 {
+	if packages {
+		return cmp.Or(e.Rank, e.Score, 5)
+	}
 	return cmp.Or(e.Rank, e.Score, 9)
 }
 
@@ -650,11 +1225,49 @@ func priority(e entry) float64 {
 // NVD allows one every 6 seconds.
 const MaxTerms = 8
 
+// preciseTerms maps the match terms of the tags given with a version and a
+// product of the NVD dictionary to the names of that product.
+//
+// Every tag or keyword given with a version is in it: the EUVD, which names no
+// product, does not count for them. The names are nil for a word without a
+// product in the dictionary: the NVD records it finds are then all kept.
+func (f *Fetcher) preciseTerms(q Query, terms []string) map[string][]string {
+	out := map[string][]string{}
+	for _, t := range append(slices.Clone(q.Tags), q.Keywords...) {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if q.Versions[t] == "" {
+			continue
+		}
+		term := t
+		if alias, ok := f.Search.Aliases[t]; ok {
+			term = alias
+		}
+		if !slices.Contains(terms, term) {
+			continue
+		}
+		out[term] = nil
+		if f.Search.CPE[t] != "" {
+			out[term] = append(f.productNames(t), normalName(t))
+		}
+	}
+	return out
+}
+
 // matchTerms returns the words entries of general sources are matched
 // against: every tag and keyword, with the aliases of sources/search.yaml.
 func matchTerms(q Query, s source.Search) []string {
 	var out []string
-	for _, w := range append(slices.Clone(q.Tags), q.Keywords...) {
+	words := append(slices.Clone(q.Tags), q.Keywords...)
+	if len(q.Order) > 0 { // the order given on the command line, tags and keywords mixed
+		at := func(w string) int {
+			if i := slices.Index(q.Order, strings.ToLower(strings.TrimSpace(w))); i >= 0 {
+				return i
+			}
+			return len(q.Order) // from a profile: after what was given
+		}
+		slices.SortStableFunc(words, func(a, b string) int { return cmp.Compare(at(a), at(b)) })
+	}
+	for _, w := range words {
 		w = strings.ToLower(strings.TrimSpace(w))
 		if alias, ok := s.Aliases[w]; ok {
 			w = alias
@@ -689,7 +1302,7 @@ func searchTerms(q Query, s source.Search) (searched terms, left []string) {
 		}
 		return true
 	})
-	out := matchTerms(Query{Tags: tags, Keywords: q.Keywords}, s)
+	out := matchTerms(Query{Tags: tags, Keywords: q.Keywords, Order: q.Order}, s)
 	n := min(len(out), MaxTerms)
 	return terms{words: out[:n], cpes: cpes}, append(out[n:], left...)
 }
@@ -727,19 +1340,100 @@ func (f *Fetcher) read(ctx context.Context, s source.Source, terms terms, q Quer
 	now := f.Now().UTC()
 	switch s.Type {
 	case source.TypeGitHubAdvisories:
-		return f.readGitHub(ctx, github+"/repos/"+s.Repo+"/security-advisories?per_page=100&sort=published&direction=desc", since, parseGitHubAdvisories)
+		u := github + "/repos/" + s.Repo + "/security-advisories?per_page=100&sort=published&direction=desc"
+		tag, version := versionOfSource(s, q)
+		if version == "" {
+			return f.readGitHub(ctx, u, since, parseGitHubAdvisories)
+		}
+		// With the version of the project, every advisory of the repository
+		// hitting it is kept whatever its date, like OSV: the project's own
+		// advisories reach OSV.dev days later, if ever.
+		entries, err := f.readGitHub(ctx, u, time.Time{}, parseGitHubAdvisories)
+		given := allPackages(q)
+		for i := range entries {
+			for j, a := range entries[i].Affected {
+				if a.Package == "" {
+					entries[i].Affected[j].Package = tag // the repository's own product
+				} else if !f.ofRepository(a.Package, tag) || unlisted(a.Package, given) {
+					continue
+				}
+				// Ranges written by hand, with the fixes apart: the fixes listed
+				// decide, branch by branch. A package the lockfile holds is
+				// compared with its own version: the MongoDB Node.js driver's
+				// advisories are read under the mongodb tag, the server's version.
+				versions := []string{version}
+				if locked := lockedVersions(entries[i].Affected[j].Package, given); len(locked) > 0 {
+					versions = locked
+				}
+				for _, v := range versions {
+					if status, fixed, ok := repoStatus(v, a.Versions, a.Fixed); ok {
+						entries[i].Affected[j].InUse, entries[i].Affected[j].Status = v, status
+						if fixed != "" {
+							entries[i].Affected[j].Fixed = fixed
+						}
+						if status == StatusAffected {
+							break
+						}
+					}
+				}
+			}
+			branchwise(entries[i].Affected)
+			// Possibly, for a release (not a branch): an earlier release of the
+			// branch a record names alone, kept for the reader to judge.
+			entries[i].Current = slices.ContainsFunc(entries[i].Affected, func(a Affected) bool {
+				return a.Status == StatusAffected || a.Status == StatusPossiblyAffected && !isBranch(a.InUse)
+			})
+		}
+		return entries, err
 	case source.TypeGitHubAdvisoryDatabase:
 		u := github + "/advisories?per_page=100&ecosystem=" + neturl.QueryEscape(s.Ecosystem) +
 			"&published=" + neturl.QueryEscape(">="+since.UTC().Format(time.DateOnly))
-		if len(q.Packages) == 0 {
+		packages := packagesFor(q, s.Ecosystem)
+		if len(packages) == 0 {
+			// The whole ecosystem only for its package manager's tag (pip, npm):
+			// the runtime's (python, node) would bring every library's advisory.
+			if len(q.Tags) > 0 && !slices.ContainsFunc(q.Tags, func(t string) bool { return NormalEcosystem(t) == NormalEcosystem(s.Ecosystem) }) {
+				return nil, nil
+			}
 			return f.readGitHub(ctx, u+"&type=reviewed", since, parseGitHubAdvisoryDatabase)
 		}
-		u += "&affects=" + neturl.QueryEscape(strings.Join(q.Packages, ","))
-		reviewed, err := f.readGitHub(ctx, u+"&type=reviewed", since, parseGitHubAdvisoryDatabase)
-		// Malicious versions of the project's packages: a thousand a month in npm,
-		// so they are only read for the packages given.
-		malware, merr := f.readGitHub(ctx, u+"&type=malware", since, parseGitHubMalware)
-		return append(reviewed, malware...), errors.Join(err, merr)
+		// The packages go in the URL: a whole lockfile is asked about in batches,
+		// or GitHub answers HTTP 414.
+		var (
+			out  []entry
+			errs []error
+		)
+		// OSV.dev compares no version of a GitHub Action: their known advisories
+		// are read here whatever their date, and compared with the version given.
+		actions := NormalEcosystem(s.Ecosystem) == "actions"
+		if actions {
+			u, since = github+"/advisories?per_page=100&ecosystem="+neturl.QueryEscape(s.Ecosystem), time.Time{}
+		}
+		for _, batch := range urlBatches(packages, ghsaAffectsLength) {
+			bu := u + "&affects=" + neturl.QueryEscape(strings.Join(batch, ","))
+			reviewed, err := f.readGitHub(ctx, bu+"&type=reviewed", since, parseGitHubAdvisoryDatabase)
+			if actions {
+				for i := range reviewed {
+					reviewed[i].Affected = annotate(reviewed[i].Affected, Query{Packages: batch}, false)
+					reviewed[i].Current = slices.ContainsFunc(reviewed[i].Affected, func(a Affected) bool { return a.Status == StatusAffected })
+				}
+			}
+			// Malicious versions of the project's packages: a thousand a month in npm,
+			// so they are only read for the packages given.
+			malware, merr := f.readGitHub(ctx, bu+"&type=malware", since, parseGitHubMalware)
+			out = append(append(out, reviewed...), malware...)
+			errs = append(errs, err, merr)
+		}
+		// A package in two batches never: each advisory comes once per batch it hits.
+		seen := map[string]bool{}
+		out = slices.DeleteFunc(out, func(e entry) bool {
+			if seen[e.URL] {
+				return true
+			}
+			seen[e.URL] = true
+			return false
+		})
+		return out, errors.Join(errs...)
 	case source.TypeKEV:
 		return f.readOne(ctx, s.URL, "", parseKEV)
 	case source.TypeEUVD:
@@ -793,7 +1487,21 @@ func (f *Fetcher) read(ctx context.Context, s source.Source, terms terms, q Quer
 			return parseNVD(data, map[string]string{s.Tags[0]: s.Product}, 0)
 		})
 	case source.TypeOSV:
-		return f.readOSV(ctx, s.Ecosystem, q.Packages, q.Components)
+		packages := packagesFor(q, s.Ecosystem)
+		if s.Ecosystem == "Go" {
+			packages = goToolchain(packages, q.Versions["go"])
+		}
+		return f.readOSV(ctx, s.Ecosystem, packages, q.Components)
+	case source.TypePackagist:
+		packages := withComponents(packagesFor(q, "composer"), q.Components, "Packagist")
+		// The whole ecosystem only for the package manager's tag: php alone would
+		// list every Laravel, Magento and Contao advisory of the week.
+		if len(packages) == 0 && len(q.Tags) > 0 && !slices.Contains(q.Tags, "composer") {
+			return nil, nil
+		}
+		return f.readPackagist(ctx, s.URL, packages, since)
+	case source.TypeRubySec:
+		return f.readRubySec(ctx, s.URL, withComponents(packagesFor(q, "rubygems"), q.Components, "RubyGems"), q.Versions, since)
 	case source.TypeNuclei:
 		return f.readOne(ctx, s.URL, "", parseNuclei)
 	case source.TypeMetasploit:
@@ -960,14 +1668,66 @@ func (f *Fetcher) do(ctx context.Context, url, body, api string) (data []byte, n
 			req.Header.Set("Authorization", "Bearer "+f.GitHubToken)
 		}
 	}
-	if api == "nvd" && f.NVDAPIKey != "" {
+	if api == "nvd" && f.NVDAPIKey != "" && !f.nvdKeyRejected() {
 		req.Header.Set("apiKey", f.NVDAPIKey)
 	}
-	resp, err := f.Client.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("unreachable: %w", err)
+	var resp *http.Response
+	for attempt := 1; ; attempt++ {
+		resp, err = f.Client.Do(req)
+		if err != nil {
+			// The NVD also times out for a moment: tried again like a 503.
+			if api != "nvd" || attempt == nvdAttempts || ctx.Err() != nil {
+				return nil, "", fmt.Errorf("unreachable: %w", err)
+			}
+			select {
+			case <-ctx.Done():
+				return nil, "", ctx.Err()
+			case <-time.After(time.Duration(attempt) * f.RetryDelay):
+			}
+			continue
+		}
+		// The NVD often answers 502 to 504 for a moment, and 403 or 429 when
+		// requests come too close: a later try usually works, later still for
+		// the rate limit, which counts requests over 30 seconds.
+		limited := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden
+		if api != "nvd" || attempt == nvdAttempts || !limited && (resp.StatusCode < 502 || resp.StatusCode > 504) {
+			break
+		}
+		resp.Body.Close()
+		wait := time.Duration(attempt) * f.RetryDelay
+		if limited {
+			wait *= 3
+			// Every NVD request waits, not only this one: the limit counts them all.
+			if f.nvdGate != nil {
+				f.nvdGate.hold(wait)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, "", ctx.Err()
+		case <-time.After(wait):
+		}
+		// The try again counts against the limit like any request: it takes its turn.
+		if f.nvdGate != nil {
+			if err := f.nvdGate.wait(ctx); err != nil {
+				return nil, "", err
+			}
+		}
 	}
 	defer resp.Body.Close()
+	// A key the NVD does not know (a typo, a new key not yet activated from
+	// the link it emails) makes every request fail with 404: the searches run
+	// again without it, at the pace the NVD allows without a key, and the
+	// rejection is reported once.
+	if api == "nvd" && req.Header.Get("apiKey") != "" && resp.StatusCode == http.StatusNotFound && strings.Contains(strings.ToLower(resp.Header.Get("message")), "apikey") {
+		if f.nvdRejected != nil {
+			f.nvdRejected.Store(true)
+		}
+		if f.nvdGate != nil {
+			f.nvdGate.slowTo(nvdDelayWithoutKey)
+		}
+		return f.do(ctx, url, body, api)
+	}
 	data, err = io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	if err != nil {
 		return nil, "", fmt.Errorf("read failed: %w", err)
@@ -998,6 +1758,39 @@ func (f *Fetcher) do(ctx context.Context, url, body, api string) (data []byte, n
 		}
 	}
 	return data, next, nil
+}
+
+// nvdAttempts bounds the tries of one NVD request answering 502 to 504.
+const nvdAttempts = 3
+
+// nvdDelayWithoutKey is the pause the NVD asks between two requests without a
+// key: 5 requests per 30 seconds.
+const nvdDelayWithoutKey = 6500 * time.Millisecond
+
+// NVDKeyRejected is the failure reported when the NVD refuses NVD_API_KEY.
+const NVDKeyRejected = "the NVD rejected NVD_API_KEY (HTTP 404, \"Invalid apiKey\"): its searches ran without the key, at the slower pace; check the key (a new one works once activated from the link the NVD emails) or unset it"
+
+// nvdKeyRejected tells whether the NVD refused the key during this run.
+func (f *Fetcher) nvdKeyRejected() bool {
+	return f.nvdRejected != nil && f.nvdRejected.Load()
+}
+
+// hold makes the next request through the gate wait at least d from now.
+func (g *gate) hold(d time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if next := time.Now().Add(d - g.delay); next.After(g.last) {
+		g.last = next
+	}
+}
+
+// slowTo raises the pause of a gate that paces its requests, never lowers it.
+func (g *gate) slowTo(d time.Duration) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.delay > 0 {
+		g.delay = max(g.delay, d)
+	}
 }
 
 var nextLink = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)

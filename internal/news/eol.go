@@ -55,6 +55,10 @@ type eolRelease struct {
 	} `json:"latest"`
 }
 
+// eolNames maps the names a project uses to the products of endoflife.date
+// that know them under another name.
+var eolNames = map[string]string{"docker": "docker-engine", "moby": "docker-engine"}
+
 // Support looks up the support status of components given as name@version
 // (php@8.3.35, node@22, gitlab). One failure fails the whole lookup: a
 // partial answer would read as "the others are fine".
@@ -76,7 +80,10 @@ func (f *Fetcher) Support(ctx context.Context, components []string) ([]Support, 
 		return nil, fmt.Errorf("endoflife.date: unexpected product list: %w", err)
 	}
 	product := func(name string) string {
-		for _, n := range []string{name, strings.NewReplacer(".", "", " ", "-").Replace(name)} {
+		for _, n := range []string{name, strings.NewReplacer(".", "", " ", "-").Replace(name), eolNames[name]} {
+			if n == "" {
+				continue
+			}
 			for _, p := range list.Result {
 				if p.Name == n || slices.Contains(p.Aliases, n) {
 					return p.Name
@@ -116,10 +123,21 @@ func (f *Fetcher) Support(ctx context.Context, components []string) ([]Support, 
 // judge sets the status of s from the releases of its product.
 func (f *Fetcher) judge(s *Support, releases []eolRelease) {
 	v := strings.TrimPrefix(s.Version, "v")
+	if i := strings.Index(v, "-"); i > 0 && isBranch(v[:i]) {
+		v = v[:i] // an image tag (16-alpine) follows the latest release of its branch
+	}
 	var r *eolRelease
 	for i, rel := range releases { // the longest cycle the version belongs to: 1.27 rather than 1
-		if (v == rel.Name || strings.HasPrefix(v, rel.Name+".")) && (r == nil || len(rel.Name) > len(r.Name)) {
+		if inCycle(v, rel.Name) && (r == nil || len(rel.Name) > len(r.Name)) {
 			r = &releases[i]
+		}
+	}
+	if r == nil && v != "" { // docker-engine@24 names the 24.0 cycle
+		for i, rel := range releases {
+			if strings.HasPrefix(rel.Name, v+".") {
+				r = &releases[i]
+				break // the releases come newest first
+			}
 		}
 	}
 	if r == nil {
@@ -127,6 +145,21 @@ func (f *Fetcher) judge(s *Support, releases []eolRelease) {
 		for _, rel := range releases {
 			if rel.IsMaint {
 				maintained = append(maintained, rel.Name)
+			}
+		}
+		// endoflife.date lists only the recent cycles of some products
+		// (gitlab-runner): a release older than all of them is long unsupported.
+		if len(releases) > 0 && v != "" && v[0] >= '0' && v[0] <= '9' {
+			oldest := releases[0].Name
+			for _, rel := range releases {
+				if compareVersions(rel.Name, oldest) < 0 {
+					oldest = rel.Name
+				}
+			}
+			if compareVersions(v, oldest) < 0 {
+				s.Status = StatusEOL
+				s.Note = "older than every cycle endoflife.date lists (the oldest is " + oldest + "): no security fixes; upgrade to a maintained cycle: " + strings.Join(maintained, ", ")
+				return
 			}
 		}
 		s.Note = "version unknown or too vague to find its cycle; maintained cycles: " + strings.Join(maintained, ", ")
@@ -138,12 +171,21 @@ func (f *Fetcher) judge(s *Support, releases []eolRelease) {
 	}
 	eol, _ := time.Parse(time.DateOnly, r.EOLFrom)
 	now := f.Now()
+	// A branch (node@22, docker-engine@24) follows its latest release: only a
+	// release can be behind.
+	behind := s.Latest != "" && v != r.Name && !isBranch(v) && compareVersions(v, s.Latest) < 0
+	// An old cycle still gets its last fixes: being behind on them is said
+	// too, since the upgrade to the latest patch release is the quick step.
+	behindNote := ""
+	if behind {
+		behindNote = "; also behind: the latest " + r.Name + " release is " + s.Latest + " (" + r.Latest.Date + "), update to it first"
+	}
 	switch {
 	case r.IsEOL || !eol.IsZero() && !now.Before(eol): // the date passed before the data says so
-		s.Status, s.Note = StatusEOL, "no security fixes since "+r.EOLFrom+": upgrade to a maintained cycle"
+		s.Status, s.Note = StatusEOL, "no security fixes since "+r.EOLFrom+": upgrade to a maintained cycle"+behindNote
 	case !eol.IsZero() && eol.Sub(now) < EndingWithin:
-		s.Status, s.Note = StatusEnding, fmt.Sprintf("security fixes stop on %s, in %d days: plan the upgrade", r.EOLFrom, int(eol.Sub(now).Hours()/24)+1)
-	case s.Latest != "" && v != r.Name && compareVersions(v, s.Latest) < 0:
+		s.Status, s.Note = StatusEnding, fmt.Sprintf("security fixes stop on %s, in %d days: plan the upgrade%s", r.EOLFrom, int(eol.Sub(now).Hours()/24)+1, behindNote)
+	case behind:
 		s.Status, s.Note = StatusBehind, "the latest "+r.Name+" release is "+s.Latest+" ("+r.Latest.Date+"): patch releases often carry security fixes"
 	default:
 		s.Status, s.Note = StatusSupported, "supported"
@@ -154,6 +196,21 @@ func (f *Fetcher) judge(s *Support, releases []eolRelease) {
 	if r.IsEOAS && !r.IsEOL {
 		s.Note += " (active support has ended, only security fixes are published)"
 	}
+}
+
+// inCycle tells whether a version belongs to a cycle: 8.3.35 to 8.3, and the
+// releases written with a letter or an image variant, 1.1.1w to OpenSSL's
+// 1.1.1 and 16-alpine to PostgreSQL's 16.
+func inCycle(v, cycle string) bool {
+	rest, ok := strings.CutPrefix(v, cycle)
+	if !ok || cycle == "" {
+		return false
+	}
+	if rest == "" || rest[0] == '.' || rest[0] == '-' {
+		return true
+	}
+	// a letter right after the last number (1.1.1w), not a longer number (1.10)
+	return len(rest) <= 2 && rest[0] >= 'a' && rest[0] <= 'z' && cycle[len(cycle)-1] >= '0' && cycle[len(cycle)-1] <= '9'
 }
 
 // SupportSource names the items SupportItems makes.
